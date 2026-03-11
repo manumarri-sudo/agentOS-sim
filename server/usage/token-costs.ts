@@ -43,27 +43,39 @@ export interface CLIUsage {
 }
 
 export interface CLIJsonResponse {
-  content: { type: string; text: string }[]
-  totalTokens: number
-  usage: CLIUsage
-  totalDurationMs: number
-  status: string
+  // --print --output-format json returns { result: string, usage: {...}, ... }
+  result?: string
+  // Some versions return content blocks instead
+  content?: { type: string; text: string }[]
+  totalTokens?: number
+  usage?: CLIUsage
+  total_cost_usd?: number
+  duration_ms?: number
+  type?: string
 }
 
 export function parseCliJsonResponse(raw: string): { text: string; usage: CLIUsage; totalTokens: number } | null {
   try {
     const parsed: CLIJsonResponse = JSON.parse(raw)
 
-    // Extract text from content blocks
-    const text = (parsed.content ?? [])
-      .filter((c: any) => c.type === 'text')
-      .map((c: any) => c.text)
-      .join('\n')
+    // Claude CLI --print --output-format json returns { result: "...", usage: {...} }
+    let text = ''
+
+    if (parsed.result && typeof parsed.result === 'string') {
+      // New format: direct result string
+      text = parsed.result
+    } else if (parsed.content && Array.isArray(parsed.content)) {
+      // Legacy format: content blocks
+      text = parsed.content
+        .filter((c: any) => c.type === 'text')
+        .map((c: any) => c.text)
+        .join('\n')
+    }
 
     return {
       text,
       usage: parsed.usage ?? { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
-      totalTokens: parsed.totalTokens ?? 0,
+      totalTokens: parsed.totalTokens ?? (parsed.usage ? (parsed.usage.input_tokens + parsed.usage.output_tokens) : 0),
     }
   } catch {
     return null

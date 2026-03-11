@@ -156,7 +156,8 @@ export function authMiddleware() {
     const method = c.req.method
 
     // Skip auth for non-API routes (static files, SSE stream, root)
-    if (!path.startsWith('/api/')) {
+    // Also skip for /public/* routes (read-only spectator dashboard)
+    if (!path.startsWith('/api/') || path.startsWith('/public/')) {
       await next()
       return
     }

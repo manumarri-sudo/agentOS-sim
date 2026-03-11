@@ -68,8 +68,18 @@ const TENSION_PAIRS: Array<{
   },
 ]
 
-// Track what we've already triggered to avoid spam
-const triggeredInteractions = new Set<string>()
+// ---------------------------------------------------------------------------
+// Persistent dedup — keys stored in SQLite, survives restarts
+// ---------------------------------------------------------------------------
+function hasInteractionKey(key: string): boolean {
+  const db = getDb()
+  return !!db.query('SELECT 1 FROM interaction_keys WHERE key = ?').get(key)
+}
+
+function addInteractionKey(key: string): void {
+  const db = getDb()
+  db.run('INSERT OR IGNORE INTO interaction_keys (key) VALUES (?)', [key])
+}
 
 // ---------------------------------------------------------------------------
 // Check for cross-review opportunities
@@ -97,7 +107,7 @@ export function checkCrossReviews(
 
     // Dedupe — only one cross-review per pair per phase
     const key = `cross-${pair.agents.sort().join('-')}-p${task.phase}-${task.type}`
-    if (triggeredInteractions.has(key)) continue
+    if (hasInteractionKey(key)) continue
 
     // Check reviewer is idle and not already busy with reviews
     const reviewerInfo = db.query(
@@ -140,7 +150,7 @@ export function checkCrossReviews(
       summary: `${reviewerInfo.personality_name} assigned to cross-review ${completedAgent.personality_name}'s ${task.type} work`,
     })
 
-    triggeredInteractions.add(key)
+    addInteractionKey(key)
     console.log(`[COLLAB] Cross-review: ${reviewerInfo.personality_name} will review ${completedAgent.personality_name}'s ${task.type}`)
 
     // Only trigger one cross-review per completion (don't spam)
@@ -164,14 +174,21 @@ export function checkForDebates(phase: number): void {
     ORDER BY a.completed_at DESC
   `).all(phase) as any[]
 
-  if (completedWork.length < 4) return // need enough work to find conflicts
+  if (completedWork.length < 6) return // need enough work to find conflicts
+
+  // Max 1 facilitated debate per phase -- prevent debate spam
+  const existingDebates = db.query(`
+    SELECT COUNT(*) as n FROM actions
+    WHERE type = 'meeting' AND description LIKE '%FACILITATED DISCUSSION%' AND phase = ?
+  `).get(phase) as { n: number }
+  if (existingDebates.n >= 1) return
 
   // Check for keyword overlap that might indicate competing perspectives
   const debateOpportunities = findDebateOpportunities(completedWork)
 
   for (const debate of debateOpportunities) {
     const key = `debate-${debate.agent1}-${debate.agent2}-p${phase}`
-    if (triggeredInteractions.has(key)) continue
+    if (hasInteractionKey(key)) continue
 
     // Create a facilitated debate task for Priya (CoS)
     enqueueTask({
@@ -191,7 +208,7 @@ export function checkForDebates(phase: number): void {
       phase,
     })
 
-    triggeredInteractions.add(key)
+    addInteractionKey(key)
     console.log(`[COLLAB] Debate scheduled: ${debate.agent1Name} vs ${debate.agent2Name} on "${debate.topic}"`)
   }
 }
@@ -301,7 +318,7 @@ export function checkOneOnOneSyncs(phase: number): void {
 
   for (const chain of DEPENDENCY_CHAINS) {
     const key = `sync-${chain.producer}-${chain.consumer}-p${phase}`
-    if (triggeredInteractions.has(key)) continue
+    if (hasInteractionKey(key)) continue
 
     // Check if producer has completed the trigger type this phase
     const producerWork = db.query(`
@@ -346,7 +363,7 @@ export function checkOneOnOneSyncs(phase: number): void {
       summary: `${consumerInfo.personality_name} reacting to ${producerWork.personality_name}'s ${chain.triggerType} work`,
     })
 
-    triggeredInteractions.add(key)
+    addInteractionKey(key)
     console.log(`[COLLAB] 1:1 sync: ${consumerInfo.personality_name} reacting to ${producerWork.personality_name}'s ${chain.triggerType}`)
   }
 }

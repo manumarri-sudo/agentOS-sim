@@ -77,6 +77,14 @@ export const AGENTS: AgentConfig[] = [
     domain_knowledge_version: 'v1',
   },
 
+  // PROJECT MANAGEMENT (Tier 0 -- always runs)
+  {
+    id: 'morgan', personality_name: 'Morgan', team: 'ops', role: 'Project Manager', tier: 0,
+    personality_summary: 'Sprint master. Tracks every task, enforces handoffs, writes status and performance reports. Zero tolerance for stale work or duplicate effort.',
+    urgency: 9, urgency_reason: 'A task without an owner, a deadline, and a handoff target is a task that will never ship.',
+    domain_knowledge_version: 'v1',
+  },
+
   // OPS TEAM (Tier 2)
   {
     id: 'jordan', personality_name: 'Jordan', team: 'ops', role: 'Ops Manager', tier: 2,
@@ -152,6 +160,7 @@ export const AGENT_MODELS: Record<string, string> = {
   reza: 'haiku',
   priya: 'haiku',
   dani: 'haiku',
+  morgan: 'haiku',
   marcus: 'haiku',
   zara: 'haiku',
   nina: 'haiku',

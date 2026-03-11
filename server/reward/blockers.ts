@@ -2,6 +2,7 @@ import { getDb } from '../db/database'
 import { broadcastAGUI } from '../orchestrator'
 import { sendMessage, broadcastMessage } from '../messages/bus'
 import { logCollaborationEvent } from './ledger'
+import { logBlockerToNotion, resolveBlockerInNotion } from '../notion/sync'
 
 // ---------------------------------------------------------------------------
 // Blocked Agent Relief — doc 0 Section 5.5
@@ -55,6 +56,15 @@ export function reportBlocked(agentId: string, reason: string): string {
   )
 
   console.log(`[BLOCKER] ${agent.personality_name} blocked: ${reason}`)
+
+  // Sync to Notion (async, non-blocking)
+  const phase = (db.query(`SELECT phase_number FROM experiment_phases WHERE status = 'active'`).get() as any)?.phase_number ?? 0
+  const simDay = (db.query(`SELECT sim_day FROM sim_clock WHERE id = 1`).get() as any)?.sim_day ?? 0
+  logBlockerToNotion(agent.personality_name, reason, phase, simDay).then(notionPageId => {
+    if (notionPageId) {
+      db.run(`UPDATE blocked_agents SET notion_page_id = ? WHERE id = ?`, [notionPageId, id])
+    }
+  }).catch(() => {}) // Non-critical
 
   return id
 }
@@ -146,6 +156,12 @@ export function resolveBlocker(
   })
 
   console.log(`[BLOCKER] ${blockedName} unblocked by ${resolverName}`)
+
+  // Sync resolution to Notion
+  const notionPageId = (db.query(`SELECT notion_page_id FROM blocked_agents WHERE id = ?`).get(blockerId) as any)?.notion_page_id
+  if (notionPageId) {
+    resolveBlockerInNotion(notionPageId, resolverName)
+  }
 
   return { resolved: true }
 }

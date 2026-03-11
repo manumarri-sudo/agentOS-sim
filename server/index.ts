@@ -44,6 +44,7 @@ import {
 import { authMiddleware } from './middleware/auth'
 import { getGovernanceEvents } from './governance/observer'
 import { getPerAgentCosts, getPerTeamCosts, getPerPhaseCosts, getTokenCostTotals, MODEL_PRICING } from './usage/token-costs'
+import { PUBLIC_DASHBOARD_HTML } from './public-dashboard'
 
 // Validate environment
 validateEnv()
@@ -79,6 +80,40 @@ app.get('/api/health', (c) => {
     orchestratorCycles: getOrchestratorCycleCount(),
     remainingBudget: getRemainingBudget(),
   })
+})
+
+// Notion connectivity status
+app.get('/api/notion/status', (c) => {
+  const { getNotionStatus } = require('./notion/sync')
+  return c.json(getNotionStatus())
+})
+
+// Human tasks -- agents can request human intervention
+app.get('/api/human-tasks', (c) => {
+  const { getHumanTasks } = require('./human-tasks')
+  const status = c.req.query('status')
+  return c.json(getHumanTasks(status || undefined))
+})
+
+app.post('/api/human-tasks/:id/complete', async (c) => {
+  const { completeHumanTask } = require('./human-tasks')
+  const body = await c.req.json()
+  completeHumanTask(c.req.param('id'), body.resolution ?? 'Completed')
+  return c.json({ status: 'completed' })
+})
+
+// Experiment changelog -- for substack writeups
+app.get('/api/changelog', (c) => {
+  const { getChangelog } = require('./changelog')
+  const limit = Number(c.req.query('limit') ?? 50)
+  const eventType = c.req.query('type') || undefined
+  return c.json(getChangelog({ limit, eventType }))
+})
+
+app.get('/api/changelog/summary', (c) => {
+  const { generateWeeklySummary } = require('./changelog')
+  const sinceDay = c.req.query('since') ? Number(c.req.query('since')) : undefined
+  return c.text(generateWeeklySummary(sinceDay))
 })
 
 // SSE stream endpoint for AG-UI events
@@ -874,6 +909,86 @@ app.post('/api/ceo-chat/from-reza', async (c) => {
   `, [id, message, messageType ?? 'chat', phase, simDay])
 
   return c.json({ id, sent: true })
+})
+
+// ====================================================================
+// PUBLIC READ-ONLY DASHBOARD — no auth required
+// ====================================================================
+
+// Single snapshot endpoint: all read-only data in one fetch
+app.get('/public/api/snapshot', (c) => {
+  const db = getDb()
+
+  const agentRows = db.query(`
+    SELECT id, personality_name, team, role, status, urgency,
+           collaboration_score, capability_tier, personality_summary
+    FROM agents ORDER BY team, role
+  `).all()
+
+  const phaseRows = db.query(`SELECT phase_number, name, status, started_at, completed_at FROM experiment_phases ORDER BY phase_number`).all()
+
+  const clock = db.query(`SELECT sim_day FROM sim_clock WHERE id = 1`).get() as { sim_day: number } | null
+
+  const spent = db.query(`SELECT COALESCE(SUM(ABS(amount)), 0) as v FROM budget_entries WHERE amount < 0`).get() as { v: number }
+  const revenue = db.query(`SELECT COALESCE(SUM(amount), 0) as v FROM budget_entries WHERE amount > 0 AND notes != 'experiment_start'`).get() as { v: number }
+  const totalBudget = Number(process.env.TOTAL_EXPERIMENT_BUDGET_USD ?? 200)
+
+  const taskStats = db.query(`
+    SELECT status, COUNT(*) as n FROM actions GROUP BY status
+  `).all() as { status: string; n: number }[]
+
+  const recentTasks = db.query(`
+    SELECT a.id, a.agent_id, ag.personality_name as agent_name, a.type,
+           a.description, a.status, a.phase, a.started_at, a.completed_at
+    FROM actions a LEFT JOIN agents ag ON ag.id = a.agent_id
+    ORDER BY CASE a.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END,
+    a.started_at DESC LIMIT 60
+  `).all()
+
+  const activityRows = db.query(`
+    SELECT id, agent_id, event_type, summary, sim_day, created_at
+    FROM activity_log WHERE event_type NOT IN ('used_work', 'notified')
+    ORDER BY created_at DESC LIMIT 80
+  `).all()
+
+  const cfsRows = getCFSSummary()
+  const governanceRows = getGovernanceEvents({ limit: 30 })
+  const blockerRows = getActiveBlockers()
+  const tokenCosts = getTokenCostTotals()
+
+  const decisions = db.query(`
+    SELECT title, body, status, made_by_agent, created_at FROM decisions ORDER BY created_at DESC LIMIT 10
+  `).all()
+
+  let sprintInfo = null
+  try {
+    const sprint = db.query(`SELECT * FROM sprints WHERE status = 'active' ORDER BY number DESC LIMIT 1`).get() as any
+    if (sprint) sprintInfo = { number: sprint.number, goal: sprint.goal, tasksPlanned: sprint.tasks_planned, tasksCompleted: sprint.tasks_completed }
+  } catch {}
+
+  return c.json({
+    ts: new Date().toISOString(),
+    simDay: clock?.sim_day ?? 0,
+    agents: agentRows,
+    phases: phaseRows,
+    budget: { total: totalBudget, spent: spent.v, revenue: revenue.v, remaining: totalBudget - spent.v },
+    taskStats: Object.fromEntries(taskStats.map(r => [r.status, r.n])),
+    recentTasks,
+    activity: activityRows,
+    cfs: cfsRows,
+    governance: governanceRows,
+    blockers: blockerRows,
+    tokenCosts,
+    decisions,
+    sprint: sprintInfo,
+    orchestrator: { running: isOrchestratorRunning(), cycles: getOrchestratorCycleCount() },
+  })
+})
+
+// Self-contained public dashboard HTML (no React build needed)
+app.get('/public/dashboard', (c) => {
+  const html = PUBLIC_DASHBOARD_HTML
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
 })
 
 // ---- Serve static UI (production) ----

@@ -74,12 +74,12 @@ if (existsSync(dbPath)) {
 
   check('Agents table populated', () => {
     const r = db.query(`SELECT COUNT(*) as c FROM agents`).get() as { c: number }
-    return r.c === 18
-  }, '18 agents expected')
+    return r.c >= 18
+  }, '18+ agents expected')
 
   check('Capability tiers seeded', () => {
     const r = db.query(`SELECT COUNT(*) as c FROM capability_tiers`).get() as { c: number }
-    return r.c === 18
+    return r.c >= 18
   })
 
   check('Experiment phases seeded', () => {
@@ -114,8 +114,9 @@ if (existsSync(dbPath)) {
 
   check('All migrations applied', () => {
     const r = db.query(`SELECT COUNT(*) as c FROM schema_migrations`).get() as { c: number }
-    return r.c === 11
-  }, '11 migration files')
+    const files = readdirSync('./migrations').filter(f => f.endsWith('.sql')).length
+    return r.c === files
+  }, `${readdirSync('./migrations').filter(f => f.endsWith('.sql')).length} migration files`)
 
   check('Reward system tables exist', () => {
     db.query(`SELECT 1 FROM collaboration_events LIMIT 0`).get()

@@ -32,14 +32,59 @@ export const STATUS_COLORS: Record<string, string> = {
 export function fmtTime(iso?: string | null): string {
   if (!iso) return ''
   try {
-    return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    return new Date(iso + (iso.includes('Z') || iso.includes('+') ? '' : 'Z')).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   } catch { return '' }
 }
 
 export function fmtDate(iso?: string | null): string {
   if (!iso) return ''
   try {
-    return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' })
+    return new Date(iso + (iso.includes('Z') || iso.includes('+') ? '' : 'Z')).toLocaleDateString([], { month: 'short', day: 'numeric' })
+  } catch { return '' }
+}
+
+export function fmtDateTime(iso?: string | null): string {
+  if (!iso) return ''
+  try {
+    const d = new Date(iso + (iso.includes('Z') || iso.includes('+') ? '' : 'Z'))
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+           d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  } catch { return '' }
+}
+
+export function fmtRelative(iso?: string | null): string {
+  if (!iso) return ''
+  try {
+    const d = new Date(iso + (iso.includes('Z') || iso.includes('+') ? '' : 'Z'))
+    const now = Date.now()
+    const diff = now - d.getTime()
+    if (diff < 0) return 'just now'
+    const secs = Math.floor(diff / 1000)
+    if (secs < 60) return `${secs}s ago`
+    const mins = Math.floor(secs / 60)
+    if (mins < 60) return `${mins}m ago`
+    const hrs = Math.floor(mins / 60)
+    if (hrs < 24) return `${hrs}h ago`
+    const days = Math.floor(hrs / 24)
+    return `${days}d ago`
+  } catch { return '' }
+}
+
+export function fmtDuration(startIso?: string | null, endIso?: string | null): string {
+  if (!startIso || !endIso) return ''
+  try {
+    const s = new Date(startIso + (startIso.includes('Z') || startIso.includes('+') ? '' : 'Z'))
+    const e = new Date(endIso + (endIso.includes('Z') || endIso.includes('+') ? '' : 'Z'))
+    const diff = e.getTime() - s.getTime()
+    if (diff < 0) return ''
+    const secs = Math.floor(diff / 1000)
+    if (secs < 60) return `${secs}s`
+    const mins = Math.floor(secs / 60)
+    const remSecs = secs % 60
+    if (mins < 60) return `${mins}m ${remSecs}s`
+    const hrs = Math.floor(mins / 60)
+    const remMins = mins % 60
+    return `${hrs}h ${remMins}m`
   } catch { return '' }
 }
 

@@ -8,6 +8,11 @@
 const NOTION_API_KEY = process.env.NOTION_API_KEY ?? ''
 const ACTIVITY_LOG_DB = process.env.NOTION_ACTIVITY_LOG_DB ?? 'da8ce41c-4b56-429d-afac-95e94bd04e58'
 const AGENTOS_PAGE_ID = process.env.NOTION_AGENTOS_PAGE_ID ?? '320eb97f2a2381d9a2fdf4a51c553f3b'
+const BLOCKERS_DB = process.env.NOTION_BLOCKERS_DB ?? ''
+
+// Cache 404 status for DBs to avoid hammering a misconfigured endpoint
+const failedDbs = new Map<string, number>() // db_id -> timestamp of last failure
+const FAILURE_CACHE_MS = 5 * 60 * 1000 // 5 minutes
 
 // Folder structure for organized filing
 const FOLDERS = {
@@ -73,7 +78,16 @@ function enqueue(task: () => Promise<void>): void {
   processQueue()
 }
 
-async function notionFetch(endpoint: string, body: any): Promise<any> {
+async function notionFetch(endpoint: string, body: any, dbId?: string): Promise<any> {
+  // Skip if this DB has a cached failure
+  if (dbId && failedDbs.has(dbId)) {
+    const failedAt = failedDbs.get(dbId)!
+    if (Date.now() - failedAt < FAILURE_CACHE_MS) {
+      throw new Error(`Notion DB ${dbId.slice(0, 8)}... cached as unavailable`)
+    }
+    failedDbs.delete(dbId) // Cache expired, try again
+  }
+
   const res = await fetch('https://api.notion.com/v1' + endpoint, {
     method: 'POST',
     headers: {
@@ -85,6 +99,11 @@ async function notionFetch(endpoint: string, body: any): Promise<any> {
   })
   if (!res.ok) {
     const text = await res.text()
+    // Cache 404s to avoid repeated failures
+    if (res.status === 404 && dbId) {
+      failedDbs.set(dbId, Date.now())
+      console.warn(`[NOTION] DB ${dbId.slice(0, 8)}... returned 404 -- caching for 5 min. Is it shared with the integration?`)
+    }
     throw new Error('Notion API ' + res.status + ': ' + text.slice(0, 300))
   }
   return res.json()
@@ -191,5 +210,77 @@ export function logTaskToNotion(
         console.error('[NOTION] Doc creation failed:', e.message ?? e)
       }
     })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blocker sync -- push blockers to Notion, return page ID for tracking
+// ---------------------------------------------------------------------------
+export function logBlockerToNotion(
+  agentName: string,
+  reason: string,
+  phase: number,
+  simDay: number
+): Promise<string | null> {
+  if (!isNotionConfigured() || !BLOCKERS_DB) return Promise.resolve(null)
+
+  return new Promise((resolve) => {
+    enqueue(async () => {
+      try {
+        const result = await notionFetch('/pages', {
+          parent: { database_id: BLOCKERS_DB },
+          properties: {
+            'Agent': { title: [{ text: { content: agentName } }] },
+            'Reason': { rich_text: [{ text: { content: reason.slice(0, 1900) } }] },
+            'Status': { select: { name: 'active' } },
+            'Phase': { select: { name: 'phase_' + phase } },
+            'Sim Day': { number: simDay },
+          },
+        }, BLOCKERS_DB)
+        console.log('[NOTION] Blocker logged: ' + agentName + ' - ' + reason.slice(0, 60))
+        resolve(result?.id ?? null)
+      } catch (e: any) {
+        console.error('[NOTION] Blocker log failed:', e.message ?? e)
+        resolve(null)
+      }
+    })
+  })
+}
+
+export function resolveBlockerInNotion(notionPageId: string, resolverName: string): void {
+  if (!isNotionConfigured() || !notionPageId) return
+
+  enqueue(async () => {
+    try {
+      await fetch('https://api.notion.com/v1/pages/' + notionPageId, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': 'Bearer ' + NOTION_API_KEY,
+          'Notion-Version': '2022-06-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          properties: {
+            'Status': { select: { name: 'resolved' } },
+            'Resolved By': { rich_text: [{ text: { content: resolverName } }] },
+          },
+        }),
+      })
+      console.log('[NOTION] Blocker resolved: ' + notionPageId.slice(0, 8) + '...')
+    } catch (e: any) {
+      console.error('[NOTION] Blocker resolve failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Notion status check -- which DBs are accessible
+// ---------------------------------------------------------------------------
+export function getNotionStatus(): { configured: boolean; activityLog: string; blockers: string; failedDbs: string[] } {
+  return {
+    configured: isNotionConfigured(),
+    activityLog: ACTIVITY_LOG_DB ? 'configured' : 'not set',
+    blockers: BLOCKERS_DB ? 'configured' : 'not set',
+    failedDbs: [...failedDbs.keys()],
   }
 }

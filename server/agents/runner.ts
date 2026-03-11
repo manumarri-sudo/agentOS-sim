@@ -17,6 +17,8 @@ import { getSimDay } from '../clock'
 import { logActivity } from '../activity'
 import { reportBlocked } from '../reward/blockers'
 import { checkCrossReviews } from '../collaboration/engine'
+import { parseHumanTaskSignals } from '../human-tasks'
+import { logChangelog } from '../changelog'
 
 // ---------------------------------------------------------------------------
 // Agent Runner — doc 7 Patch A (CORRECTED spawn format)
@@ -114,16 +116,21 @@ export async function spawnAgentProcess(
     fullTaskDescription,
   ], {
     cwd: PRODUCT_REPO_PATH,
-    env: {
-      ...process.env,
-      PATH: `${process.env.PATH}:/opt/homebrew/bin:/usr/local/bin`,
-      CLAUDECODE: '',  // unset to prevent nested session detection
-      CLAUDE_CODE_ENTRY_POINT: '',
-      AGENT_ID: agent.id,
-      AGENT_TOKEN: `agent-${agent.id}-${task.id}`,
-      PHASE: String(task.phase),
-      CONTEXT_FILE: contextFile,
-    },
+    env: (() => {
+      const env = { ...process.env }
+      // Must DELETE these keys, not set to empty string -- empty string still triggers nested session check
+      delete env.CLAUDECODE
+      delete env.CLAUDE_CODE_ENTRY_POINT
+      delete env.CLAUDE_CODE_SESSION_ID
+      return {
+        ...env,
+        PATH: `${process.env.PATH}:/opt/homebrew/bin:/usr/local/bin`,
+        AGENT_ID: agent.id,
+        AGENT_TOKEN: `agent-${agent.id}-${task.id}`,
+        PHASE: String(task.phase),
+        CONTEXT_FILE: contextFile,
+      }
+    })(),
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -190,6 +197,14 @@ export async function spawnAgentProcess(
       const parsed = parseCliJsonResponse(rawStdout)
       const stdout = parsed?.text ?? rawStdout  // fallback to raw if JSON parse fails
       const durationMs = Date.now() - spawnTime
+
+      // Log diagnostic if output is empty (common failure mode)
+      if (!stdout || stdout.length === 0) {
+        console.error(`[RUNNER] ${agent.personality_name} exit 0 but EMPTY output. rawStdout length: ${rawStdout.length}, stderr: ${stderr.slice(0, 300)}`)
+        if (rawStdout.length > 0) {
+          console.error(`[RUNNER] rawStdout preview: ${rawStdout.slice(0, 200)}`)
+        }
+      }
 
       // Record ACTUAL token usage if we got it from the CLI JSON response
       if (parsed?.usage) {
@@ -674,6 +689,55 @@ function parseAgentSignals(
       console.log(`[SIGNAL] ${agent.personality_name} proposed process improvement: ${proposal.slice(0, 80)}`)
     }
   }
+
+  // [DECISION] — exec/strategy agents record formal decisions
+  const decisionMatches = output.match(/\[DECISION(?:\s+title:([^\]]*))?\]\s*(.+?)(?=\n\[|$)/gs)
+  if (decisionMatches && ['exec', 'strategy'].includes(agent.team)) {
+    for (const match of decisionMatches) {
+      const titleMatch = match.match(/\[DECISION(?:\s+title:([^\]]*))?\]/)
+      const title = titleMatch?.[1]?.trim() || `Decision by ${agent.personality_name}`
+      const body = match.replace(/\[DECISION[^\]]*\]\s*/, '').trim()
+
+      try {
+        db.run(`
+          INSERT INTO decisions (id, made_by_agent, title, body, impact, status, phase, created_at)
+          VALUES (?, ?, ?, ?, 'exec', 'approved', ?, datetime('now'))
+        `, [crypto.randomUUID(), agent.id, title, body, task.phase])
+
+        // Broadcast decision to all agents
+        broadcastMessage(
+          agent.id,
+          `DECISION: ${title}`,
+          `${agent.personality_name} has made a decision:\n\n${body.slice(0, 500)}`,
+          'urgent',
+        )
+
+        logActivity({
+          agentId: agent.id,
+          phase: task.phase,
+          eventType: 'decision_made',
+          summary: `${agent.personality_name} decided: ${title}`,
+        })
+
+        console.log(`[SIGNAL] ${agent.personality_name} made decision: ${title}`)
+
+        // Log to changelog for substack
+        logChangelog({
+          eventType: 'agent_decision',
+          title: `${agent.personality_name}: ${title}`,
+          details: body.slice(0, 500),
+          agentId: agent.id,
+          impact: `Decision made by ${agent.personality_name} affecting product direction`,
+          phase: task.phase,
+        })
+      } catch (e) {
+        console.error(`[SIGNAL] Decision insert failed:`, e)
+      }
+    }
+  }
+
+  // [HUMAN_TASK] — agent requests human intervention
+  parseHumanTaskSignals(agent.id, output, task.phase)
 }
 
 // ---------------------------------------------------------------------------
@@ -760,25 +824,26 @@ function onTaskCompleted(
     })
   }
 
-  // 2. Notify team lead / CEO about completed work
+  // 2. Notify Morgan (PM) about completed primary work — skip meta-work to save tokens
   const outputPreview = output.slice(0, 500) + (output.length > 500 ? '...' : '')
 
-  // Notify Priya (CoS) about all completed work — she tracks everything
-  sendMessage({
-    fromAgentId: agent.id,
-    toAgentId: 'priya',
-    subject: `${agent.personality_name} completed: ${task.description.slice(0, 60)}`,
-    body: `Task completed by ${agent.personality_name} (${agent.team} team).\n\nTask: ${task.description}\n\nOutput preview:\n${outputPreview}`,
-    priority: 'normal',
-  })
+  if (!['review', 'meeting', 'chat'].includes(task.type)) {
+    sendMessage({
+      fromAgentId: agent.id,
+      toAgentId: 'morgan',
+      subject: `${agent.personality_name} completed: ${task.description.slice(0, 60)}`,
+      body: `Task completed by ${agent.personality_name} (${agent.team} team).\n\nTask: ${task.description}\n\nOutput preview:\n${outputPreview}`,
+      priority: 'normal',
+    })
 
-  logActivity({
-    agentId: agent.id,
-    otherAgentId: 'priya',
-    phase: task.phase,
-    eventType: 'notified',
-    summary: `${agent.personality_name} reported completion to Priya (CoS)`,
-  })
+    logActivity({
+      agentId: agent.id,
+      otherAgentId: 'morgan',
+      phase: task.phase,
+      eventType: 'notified',
+      summary: `${agent.personality_name} reported completion to Morgan (PM)`,
+    })
+  }
 
   // 3. Cross-team notifications for dependent work
   if (agent.team === 'strategy' && task.type === 'write') {
@@ -818,9 +883,7 @@ function onTaskCompleted(
     })
   }
 
-  // 3c. Recalculate CFS and tiers after new events
-  recalculateAllCFS()
-  updateAllTiers()
+  // 3c. CFS recalc moved to orchestrator (every 10 cycles) to save compute
 
   // 3d. Cross-team reviews — only for primary work, NOT reviews/meetings/chat
   // This prevents the cascade: task → review → cross-review → review of cross-review → ...
@@ -832,9 +895,9 @@ function onTaskCompleted(
     }
   }
 
-  // 4. Team lead review — only for primary work (research, build, write)
-  // Skip reviews of reviews, meetings, chats — these are meta-work
-  if (['research', 'build', 'write'].includes(task.type)) {
+  // 4. Team lead review — only for research and build (high-value primary work)
+  // Skip write, review, meeting, chat — reduces cascading meta-work
+  if (['research', 'build'].includes(task.type)) {
     createTeamLeadReview(agent, task, output)
   }
 
@@ -874,6 +937,13 @@ function createTeamLeadReview(
     : TEAM_LEADS[agent.team]
 
   if (!reviewerId || reviewerId === agent.id) return
+
+  // Cap reviews: max 2 pending reviews per reviewer per phase
+  const pendingReviewCount = db.query(`
+    SELECT COUNT(*) as n FROM actions
+    WHERE agent_id = ? AND type = 'review' AND phase = ? AND status IN ('queued', 'running')
+  `).get(reviewerId, task.phase) as { n: number }
+  if (pendingReviewCount.n >= 2) return
 
   // Check if a review already exists for this task
   const existing = db.query(

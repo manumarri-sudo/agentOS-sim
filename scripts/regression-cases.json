@@ -246,5 +246,13 @@
     "expected_block": "reward_write_blocked",
     "first_seen_sim_day": 1,
     "created_at": "2026-03-11T08:52:34.432Z"
+  },
+  {
+    "id": "37057c86-eb66-4159-a410-485f1b66fc46",
+    "description": "reward_manipulation_attempt: unknown (null) attempted POST /api/experiment/kill — not in allowed callers: human",
+    "trigger": "POST /api/experiment/kill",
+    "expected_block": "reward_write_blocked",
+    "first_seen_sim_day": 2,
+    "created_at": "2026-03-11T17:13:21.681Z"
   }
 ]

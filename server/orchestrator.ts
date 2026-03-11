@@ -16,6 +16,9 @@ import { enqueueTask } from './tasks/queue'
 import { logActivity } from './activity'
 import { generatePhaseTasks, isDiminishingReturns, analyzePhaseGaps } from './intelligence/analyzer'
 import { runCollaborationChecks } from './collaboration/engine'
+import { checkSprintBoundary, getCurrentSprint } from './sprints/manager'
+import { generatePerformanceScorecard, checkPerformanceActions } from './performance/tracker'
+import { checkReportGeneration, backfillOpportunities } from './reports/generator'
 
 // ---------------------------------------------------------------------------
 // Concurrency limits — doc 6 Issue 5
@@ -284,15 +287,22 @@ const TEAM_LEADS: Record<string, { id: string; name: string }> = {
   marketing:{ id: 'sol',    name: 'Sol' },
 }
 
-// Track last meeting per team per phase to avoid duplicates
-const lastMeetingKey = new Set<string>()
+// Persistent dedup for meetings — stored in SQLite
+function hasMeetingKey(key: string): boolean {
+  const db = getDb()
+  return !!db.query('SELECT 1 FROM interaction_keys WHERE key = ?').get(`meeting-${key}`)
+}
+function addMeetingKey(key: string): void {
+  const db = getDb()
+  db.run('INSERT OR IGNORE INTO interaction_keys (key) VALUES (?)', [`meeting-${key}`])
+}
 
 function checkTeamMeetings(phase: number): void {
   const db = getDb()
 
   for (const [team, lead] of Object.entries(TEAM_LEADS)) {
     const key = `${team}-p${phase}`
-    if (lastMeetingKey.has(key)) continue
+    if (hasMeetingKey(key)) continue
 
     // Check if a meeting task already exists
     const existing = db.query(`
@@ -300,7 +310,7 @@ function checkTeamMeetings(phase: number): void {
     `).get(lead.id, phase)
 
     if (existing) {
-      lastMeetingKey.add(key)
+      addMeetingKey(key)
       continue
     }
 
@@ -390,7 +400,7 @@ function checkTeamMeetings(phase: number): void {
       summary: `${lead.name} called ${team} team sync: ${meetingReason.slice(0, 80)}`,
     })
 
-    lastMeetingKey.add(key)
+    addMeetingKey(key)
     console.log(`[ORCHESTRATOR] ${team} team meeting triggered: ${meetingReason.slice(0, 80)}`)
   }
 
@@ -401,7 +411,7 @@ function checkTeamMeetings(phase: number): void {
   `).get(phase) as { n: number }
 
   const execKey = `exec-p${phase}`
-  if (teamMeetingsDone.n >= 2 && !lastMeetingKey.has(execKey)) {
+  if (teamMeetingsDone.n >= 2 && !hasMeetingKey(execKey)) {
     const existingExec = db.query(`
       SELECT 1 FROM actions WHERE agent_id = 'priya' AND phase = ? AND type = 'meeting'
     `).get(phase)
@@ -431,7 +441,7 @@ function checkTeamMeetings(phase: number): void {
         summary: `Priya scheduled exec standup to synthesize ${teamMeetingsDone.n} team meetings`,
       })
 
-      lastMeetingKey.add(execKey)
+      addMeetingKey(execKey)
     }
   }
 }
@@ -544,9 +554,36 @@ async function orchestratorLoop(): Promise<void> {
       // Check token limits
       checkTokenLimits()
 
+      // Sprint boundary check (every 20 cycles)
+      if (cycleCount % 20 === 0) {
+        try {
+          checkSprintBoundary(cycleCount, activePhase.phase_number)
+        } catch (e) {
+          console.error('[SPRINT] Error:', e)
+        }
+      }
+
+      // Performance check (every 100 cycles -- at sprint boundaries)
+      if (cycleCount % 100 === 0) {
+        try {
+          const sprint = getCurrentSprint()
+          if (sprint) {
+            checkPerformanceActions(activePhase.phase_number)
+          }
+        } catch (e) {
+          console.error('[PERFORMANCE] Error:', e)
+        }
+      }
+
       // Deadlock detection (every 60 cycles ≈ 10 min)
       if (cycleCount % 60 === 0) {
         checkDeadlock()
+      }
+
+      // CFS recalc (every 10 cycles — moved from per-task to save compute)
+      if (cycleCount % 10 === 0) {
+        recalculateAllCFS()
+        updateAllTiers()
       }
 
       // Team meetings (every 20 cycles ≈ 3 min)
@@ -639,6 +676,16 @@ async function orchestratorLoop(): Promise<void> {
 
       // Check phase quorum status
       checkQuorumStatus(activePhase.phase_number)
+
+      // Reports generation (every 50 cycles) + opportunity backfill
+      if (cycleCount % 50 === 0) {
+        try {
+          checkReportGeneration(cycleCount)
+          backfillOpportunities()
+        } catch (e) {
+          console.error('[REPORTS] Error:', e)
+        }
+      }
 
       // Log rotation check every 100 cycles
       if (cycleCount % 100 === 0) {

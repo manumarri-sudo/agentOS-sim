@@ -1,4 +1,5 @@
 import { useAPI } from '../hooks/useAPI'
+import { fmtRelative, fmtDuration, fmtTime } from '../lib/utils'
 
 const STATUS_COLORS: Record<string, { bg: string; border: string; text: string; label: string }> = {
   completed: { bg: 'rgba(152,195,121,0.15)', border: '#98c379', text: '#98c379', label: 'DONE' },
@@ -106,6 +107,22 @@ export function AgentTaskTracker() {
                       </div>
                       <div className="text-[10px] text-text/70 mt-0.5 leading-relaxed">
                         {t.description.length > 120 ? t.description.slice(0, 120) + '...' : t.description}
+                      </div>
+                      <div className="text-[9px] text-muted mt-0.5">
+                        {t.status === 'running' && t.started_at && (
+                          <span>Started {fmtRelative(t.started_at)}</span>
+                        )}
+                        {t.status === 'completed' && t.completed_at && (
+                          <>
+                            <span className="text-success">{fmtTime(t.completed_at)}</span>
+                            {t.started_at && (
+                              <span className="ml-1">({fmtDuration(t.started_at, t.completed_at)})</span>
+                            )}
+                          </>
+                        )}
+                        {t.status === 'failed' && t.completed_at && (
+                          <span className="text-danger">Failed {fmtRelative(t.completed_at)}</span>
+                        )}
                       </div>
                     </div>
                   </div>

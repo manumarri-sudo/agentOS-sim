@@ -75,6 +75,53 @@ export async function updateAgentMemory(
   await Bun.write(path, existing + newEntry)
 }
 
+// Get unresolved blockers for this agent
+function getOpenTickets(agentId: string): string {
+  const db = getDb()
+  const blockers = db.query(`
+    SELECT reason, created_at FROM blocked_agents
+    WHERE agent_id = ? AND resolved_at IS NULL
+    ORDER BY created_at DESC
+  `).all(agentId) as { reason: string; created_at: string }[]
+
+  if (blockers.length === 0) return ''
+
+  return blockers.map((b, i) =>
+    `${i + 1}. [BLOCKER] ${b.reason} (since ${b.created_at})`
+  ).join('\n')
+}
+
+// Get current sprint info
+function getSprintContext(agentId?: string): string {
+  const db = getDb()
+  const sprint = db.query(`
+    SELECT id, number, goal, tasks_planned, tasks_completed, started_at
+    FROM sprints WHERE status = 'active' ORDER BY number DESC LIMIT 1
+  `).get() as { id: string; number: number; goal: string; tasks_planned: number; tasks_completed: number; started_at: string } | null
+
+  if (!sprint) return ''
+
+  let ctx = `Sprint #${sprint.number} -- Goal: ${sprint.goal}\nProgress: ${sprint.tasks_completed}/${sprint.tasks_planned} tasks completed`
+
+  if (agentId) {
+    const myTasks = db.query(`
+      SELECT type, description, status FROM actions
+      WHERE agent_id = ? AND sprint_id = ? AND status IN ('queued', 'running', 'completed')
+      ORDER BY status DESC LIMIT 5
+    `).all(agentId, sprint.id) as { type: string; description: string; status: string }[]
+
+    if (myTasks.length > 0) {
+      ctx += '\nYour sprint tasks:'
+      for (const t of myTasks) {
+        const prefix = t.status === 'completed' ? '[DONE]' : t.status === 'running' ? '[IN PROGRESS]' : '[QUEUED]'
+        ctx += `\n  ${prefix} ${t.type}: ${t.description.slice(0, 80)}`
+      }
+    }
+  }
+
+  return ctx
+}
+
 export async function buildContextFile(
   personalityName: string,
   taskDescription: string,
@@ -98,10 +145,18 @@ export async function buildContextFile(
     }
   }
 
+  // Open tickets/blockers for this agent
+  const openTickets = agentId ? getOpenTickets(agentId) : ''
+
+  // Sprint context
+  const sprintContext = getSprintContext(agentId)
+
   return `# Context for ${personalityName}
 ## Simulation Day: ${simDay}
 ## Current Phase: ${phase}
 
+${sprintContext ? `## Current Sprint\n${sprintContext}\n` : ''}
+${openTickets ? `## YOUR OPEN TICKETS\n${openTickets}\n` : ''}
 ${memory ? `## Your Previous Work\n${memory}\n` : ''}
 ${smartContext}
 ${pendingMessages ? `## Messages For You\n${pendingMessages}\n` : ''}

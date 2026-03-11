@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useAPI } from '../hooks/useAPI'
+import { fmtRelative, fmtDuration, fmtTime } from '../lib/utils'
 
 const STATUS_STYLE: Record<string, { color: string; label: string; bg: string }> = {
   running:   { color: '#61afef', label: 'RUNNING',   bg: 'rgba(97,175,239,0.08)' },
@@ -52,7 +53,23 @@ export function TaskList() {
               </span>
               <span className="text-[10px] text-text font-medium">{task.agent_name}</span>
               <span className="text-[9px] text-muted uppercase">{task.type}</span>
-              <span className="text-[8px] text-muted ml-auto">Phase {task.phase}</span>
+              <span className="text-[8px] text-muted ml-auto flex items-center gap-2">
+                {task.status === 'running' && task.started_at && (
+                  <span className="text-accent">{fmtRelative(task.started_at)}</span>
+                )}
+                {task.status === 'completed' && task.completed_at && (
+                  <>
+                    <span className="text-success">{fmtTime(task.completed_at)}</span>
+                    {task.started_at && (
+                      <span className="text-muted">({fmtDuration(task.started_at, task.completed_at)})</span>
+                    )}
+                  </>
+                )}
+                {task.status === 'failed' && task.completed_at && (
+                  <span className="text-danger">{fmtRelative(task.completed_at)}</span>
+                )}
+                Phase {task.phase}
+              </span>
             </div>
 
             {/* Description - always visible */}

@@ -10,6 +10,10 @@ dist
 sim.db
 sim.db-wal
 sim.db-shm
+sim.db.bak
+
+# screenshots
+screenshots/
 
 # secrets
 .secrets/
@@ -34,3 +38,6 @@ coverage
 
 # OS
 .DS_Store
+
+# Claude Code local config
+.claude/
