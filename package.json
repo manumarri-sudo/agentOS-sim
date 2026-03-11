@@ -1,0 +1,25 @@
+{
+  "name": "agentos-sim",
+  "module": "server/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --hot server/index.ts",
+    "migrate": "bun run server/db/migrate.ts",
+    "seed": "bun run scripts/seed.ts",
+    "audit": "bun run scripts/audit.ts",
+    "reset": "bun run scripts/reset.ts",
+    "orchestrator": "bun run --watch server/orchestrator.ts",
+    "orchestrator:prod": "bun run server/orchestrator.ts",
+    "typecheck": "bun tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "hono": "^4"
+  }
+}

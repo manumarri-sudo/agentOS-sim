@@ -1,0 +1,36 @@
+# dependencies
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# database
+sim.db
+sim.db-wal
+sim.db-shm
+
+# secrets
+.secrets/
+.env
+.env.*.local
+
+# logs (tracked in git but contents are runtime)
+logs/*.log
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# code coverage
+coverage
+*.lcov
+
+# IDE
+.idea
+.vscode
+
+# OS
+.DS_Store
