@@ -4,6 +4,8 @@ import { streamSSE } from 'hono/streaming'
 import { validateEnv } from './startup/validate-env'
 import { runMigrations } from './db/migrate'
 import { getDb } from './db/database'
+import { messageRoutes } from './messages/routes'
+import { getTaskStats, getQueuedTasks } from './tasks/queue'
 
 // Validate environment
 validateEnv()
@@ -126,6 +128,19 @@ app.get('/api/messages', (c) => {
     ORDER BY m.created_at DESC LIMIT ?
   `).all(limit)
   return c.json(messages)
+})
+
+// Message bus routes
+app.route('/api/messages', messageRoutes)
+
+// Task queue endpoints
+app.get('/api/tasks/stats', (c) => {
+  return c.json(getTaskStats())
+})
+
+app.get('/api/tasks/queued/:phase', (c) => {
+  const phase = Number(c.req.param('phase'))
+  return c.json(getQueuedTasks(phase))
 })
 
 // Sim clock endpoint
