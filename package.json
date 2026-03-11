@@ -5,13 +5,20 @@
   "private": true,
   "scripts": {
     "dev": "bun run --hot server/index.ts",
+    "ui:dev": "cd ui && bun run dev",
+    "ui:build": "cd ui && bun install && bun run build",
     "migrate": "bun run server/db/migrate.ts",
     "seed": "bun run scripts/seed.ts",
     "audit": "bun run scripts/audit.ts",
     "reset": "bun run scripts/reset.ts",
     "orchestrator": "bun run --watch server/orchestrator.ts",
     "orchestrator:prod": "bun run server/orchestrator.ts",
-    "typecheck": "bun tsc --noEmit"
+    "regression": "bun run scripts/regression.ts",
+    "typecheck": "bun tsc --noEmit",
+    "replay": "bun run scripts/replay.ts",
+    "dry-run": "bun run scripts/dry-run.ts",
+    "init-product-repo": "bun run scripts/init-product-repo.ts",
+    "log-rotate": "bun run server/log-rotate.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -20,6 +27,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "googleapis": "^171.4.0",
     "hono": "^4"
   }
 }

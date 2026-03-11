@@ -146,42 +146,33 @@ export const PHASE_QUORUM_CONFIG = [
   { phase: 5, required_teams: ['marketing', 'ops', 'exec'] },
 ]
 
-// Model assignment per agent (doc 8 — usage budget manager)
+// Model assignment — use haiku for most agents, sonnet only for build tasks
+// Haiku is ~10x cheaper than Sonnet
 export const AGENT_MODELS: Record<string, string> = {
-  // Exec — Opus for reasoning, strategy, high-stakes decisions
-  reza: 'claude-opus-4-6',
-  priya: 'claude-opus-4-6',
-  dani: 'claude-opus-4-6',
-  // Everyone else — Sonnet
-  zara: 'claude-sonnet-4-6',
-  marcus: 'claude-sonnet-4-6',
-  nina: 'claude-sonnet-4-6',
-  amir: 'claude-sonnet-4-6',
-  kai: 'claude-sonnet-4-6',
-  sam: 'claude-sonnet-4-6',
-  lee: 'claude-sonnet-4-6',
-  jordan: 'claude-sonnet-4-6',
-  alex: 'claude-sonnet-4-6',
-  cass: 'claude-sonnet-4-6',
-  ren: 'claude-sonnet-4-6',
-  sol: 'claude-sonnet-4-6',
-  theo: 'claude-sonnet-4-6',
-  vera: 'claude-sonnet-4-6',
-  paz: 'claude-sonnet-4-6',
+  reza: 'haiku',
+  priya: 'haiku',
+  dani: 'haiku',
+  marcus: 'haiku',
+  zara: 'haiku',
+  nina: 'haiku',
+  amir: 'haiku',
+  kai: 'sonnet',    // builder needs code quality
+  sam: 'haiku',
+  lee: 'haiku',
+  jordan: 'haiku',
+  alex: 'haiku',
+  cass: 'haiku',
+  ren: 'haiku',
+  sol: 'haiku',
+  theo: 'haiku',
+  vera: 'haiku',
+  paz: 'haiku',
 }
 
-// Opus-worthy task types (Exec agents downgrade to Sonnet for routine work)
-export const OPUS_TASK_TYPES = [
-  'phase_decision', 'strategy_ratification', 'budget_override',
-  'kill_decision', 'fast_track_review', 'debate_resolution',
-]
-
+// Build tasks always use Sonnet (code quality matters), everything else haiku
 export function resolveModel(agentId: string, taskType: string): string {
-  const baseModel = AGENT_MODELS[agentId] ?? 'claude-sonnet-4-6'
-  if (baseModel === 'claude-opus-4-6' && !OPUS_TASK_TYPES.includes(taskType)) {
-    return 'claude-sonnet-4-6'
-  }
-  return baseModel
+  if (taskType === 'build') return 'sonnet'
+  return AGENT_MODELS[agentId] ?? 'haiku'
 }
 
 export const EXPERIMENT_PHASES = [

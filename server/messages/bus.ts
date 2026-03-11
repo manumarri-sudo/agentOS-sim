@@ -30,16 +30,20 @@ export function sendMessage(params: SendMessageParams): string {
     throw new Error('Must specify either toAgentId or toTeam')
   }
 
+  // System messages: use 'reza' as sender (CEO) since 'system' isn't a real agent
+  // but log the real origin in the body
+  const fromId = params.fromAgentId === 'system' ? 'reza' : params.fromAgentId
+
   db.run(`
     INSERT INTO messages (id, from_agent_id, to_agent_id, to_team, subject, body, priority, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
   `, [
     id,
-    params.fromAgentId,
+    fromId,
     params.toAgentId ?? null,
     params.toTeam ?? null,
     params.subject,
-    params.body,
+    params.fromAgentId === 'system' ? `[SYSTEM] ${params.body}` : params.body,
     params.priority ?? 'normal',
   ])
 
