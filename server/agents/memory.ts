@@ -2,6 +2,116 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { getDb } from '../db/database'
 
+// ---------------------------------------------------------------------------
+// Reflexion Memory — "Never Again" Protocol
+//
+// Stores generalized rules agents learn from catastrophic failures.
+// These rules are injected into every future system prompt so the agent
+// never repeats the same mistake.
+// ---------------------------------------------------------------------------
+
+// Ensure the agent_memories table exists (idempotent)
+try {
+  const db = getDb()
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_memories (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      triggering_error TEXT NOT NULL,
+      generalized_rule TEXT NOT NULL,
+      source_task_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `)
+  db.run(`CREATE INDEX IF NOT EXISTS idx_agent_memories_agent ON agent_memories(agent_id)`)
+} catch {
+  // Table may already exist
+}
+
+/**
+ * Save a learned rule from a post-mortem into the agent's permanent memory.
+ */
+export function saveLearnedRule(params: {
+  agentId: string
+  triggeringError: string
+  generalizedRule: string
+  sourceTaskId?: string
+}): string {
+  const db = getDb()
+  const id = crypto.randomUUID()
+
+  // Dedupe: don't store near-duplicate rules (Jaccard on words)
+  const existing = db.query(`
+    SELECT generalized_rule FROM agent_memories WHERE agent_id = ?
+  `).all(params.agentId) as { generalized_rule: string }[]
+
+  const newWords = new Set(params.generalizedRule.toLowerCase().split(/\s+/))
+  for (const row of existing) {
+    const oldWords = new Set(row.generalized_rule.toLowerCase().split(/\s+/))
+    const intersection = new Set([...newWords].filter(w => oldWords.has(w)))
+    const union = new Set([...newWords, ...oldWords])
+    const jaccard = union.size > 0 ? intersection.size / union.size : 0
+    if (jaccard > 0.7) {
+      console.log(`[REFLEXION] Skipping duplicate rule for ${params.agentId} (Jaccard=${jaccard.toFixed(2)})`)
+      return ''
+    }
+  }
+
+  db.run(`
+    INSERT INTO agent_memories (id, agent_id, triggering_error, generalized_rule, source_task_id)
+    VALUES (?, ?, ?, ?, ?)
+  `, [id, params.agentId, params.triggeringError, params.generalizedRule, params.sourceTaskId ?? null])
+
+  console.log(`[REFLEXION] Saved rule for ${params.agentId}: ${params.generalizedRule.slice(0, 80)}`)
+  return id
+}
+
+/**
+ * Get all learned rules for an agent (for prompt injection).
+ */
+export function getLearnedRules(agentId: string): string[] {
+  const db = getDb()
+  const rows = db.query(`
+    SELECT generalized_rule FROM agent_memories
+    WHERE agent_id = ?
+    ORDER BY created_at ASC
+  `).all(agentId) as { generalized_rule: string }[]
+
+  return rows.map(r => r.generalized_rule)
+}
+
+/**
+ * Parse <GENERALIZED_RULE> tags from post-mortem output.
+ */
+export function parseGeneralizedRules(output: string): string[] {
+  const rules: string[] = []
+  const pattern = /<GENERALIZED_RULE>([\s\S]*?)<\/GENERALIZED_RULE>/g
+  let match
+  while ((match = pattern.exec(output)) !== null) {
+    const rule = match[1].trim()
+    if (rule.length > 10) rules.push(rule)
+  }
+  return rules
+}
+
+// ---------------------------------------------------------------------------
+// Cited Agent ID tracking -- populated by buildContextFile(), consumed by runner.ts
+// Maps taskId -> agent IDs whose work was actually used in smart context (top-3)
+// ---------------------------------------------------------------------------
+const citedAgentsMap = new Map<string, string[]>()
+
+export function storeCitedAgents(taskId: string, agentIds: string[]): void {
+  citedAgentsMap.set(taskId, agentIds)
+}
+
+export function getCitedAgents(taskId: string): string[] {
+  return citedAgentsMap.get(taskId) ?? []
+}
+
+export function clearCitedAgents(taskId: string): void {
+  citedAgentsMap.delete(taskId)
+}
+
 const MEMORY_DIR = join(process.env.HOME ?? '~', '.claude', 'agents')
 
 // Ensure memory directory exists
@@ -126,18 +236,27 @@ export async function buildContextFile(
   personalityName: string,
   taskDescription: string,
   phase: number,
-  agentId?: string
+  agentId?: string,
+  taskId?: string
 ): Promise<string> {
+  const db = getDb()
   const memory = await readAgentMemory(personalityName)
   const simDay = getSimDay()
   const pendingMessages = agentId ? getPendingMessages(agentId) : ''
 
   // Use intelligence layer for smart context instead of dumping everything
+  // Also track which agents' work was cited (for targeted citation in runner.ts)
   let smartContext = ''
   if (agentId) {
     try {
-      const { buildSmartContext } = await import('../intelligence/analyzer')
-      smartContext = buildSmartContext(agentId, personalityName, taskDescription, phase)
+      const { buildSmartContextWithCitations } = await import('../intelligence/analyzer')
+      const result = buildSmartContextWithCitations(agentId, personalityName, taskDescription, phase)
+      smartContext = result.context
+
+      // Store cited agent IDs so runner.ts can award output_cited to only these agents
+      if (taskId && result.citedAgentIds.length > 0) {
+        storeCitedAgents(taskId, result.citedAgentIds)
+      }
     } catch (e) {
       // Fallback to old approach if intelligence layer fails
       smartContext = getRelevantTeamWork(agentId, phase)
@@ -151,11 +270,34 @@ export async function buildContextFile(
   // Sprint context
   const sprintContext = getSprintContext(agentId)
 
+  // Daily brief -- synthesized project state for cognitive coherence
+  let dailyBrief = ''
+  try {
+    const { getLatestBrief } = await import('../briefs/daily-brief')
+    const brief = getLatestBrief()
+    if (brief) {
+      dailyBrief = `## Today's Situation (Sim Day ${brief.sim_day})\n${brief.content}\n`
+    }
+  } catch {
+    // Brief system not yet initialized -- skip
+  }
+
+  // Failure context -- if this task previously failed, inject context so agent avoids repeating
+  let failureContext = ''
+  if (taskId) {
+    const failureRow = db.query(`SELECT failure_context FROM actions WHERE id = ?`).get(taskId) as { failure_context: string | null } | null
+    if (failureRow?.failure_context) {
+      failureContext = `## PREVIOUS FAILURE CONTEXT\n${failureRow.failure_context}\nDo NOT repeat the same approach. Try a fundamentally different strategy.\n\n`
+    }
+  }
+
   return `# Context for ${personalityName}
 ## Simulation Day: ${simDay}
 ## Current Phase: ${phase}
 
 ${sprintContext ? `## Current Sprint\n${sprintContext}\n` : ''}
+${dailyBrief}
+${failureContext}
 ${openTickets ? `## YOUR OPEN TICKETS\n${openTickets}\n` : ''}
 ${memory ? `## Your Previous Work\n${memory}\n` : ''}
 ${smartContext}

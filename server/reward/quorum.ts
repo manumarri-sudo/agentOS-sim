@@ -4,6 +4,7 @@ import { advanceSimDay } from '../clock'
 import { logCollaborationEvent } from './ledger'
 import { logGovernanceEvent } from '../governance/observer'
 import { finalizePhaseVelocity } from './velocity'
+import { checkFeasibilityGate, createFeasibilitySpikes } from '../governance/feasibility'
 
 // ---------------------------------------------------------------------------
 // Phase Gate Quorum Enforcement — doc 6 Issue 6
@@ -136,6 +137,40 @@ export function attemptPhaseAdvance(currentPhase: number, approvedBy: string): {
       advanced: false,
       reason: `Quorum not met. Missing teams: ${quorum.missingTeams.join(', ')}`,
     }
+  }
+
+  // Feasibility gate: Phase 2 -> 3 requires technical spike validation
+  // Human approval explicitly overrides the feasibility gate (human authority)
+  if (currentPhase === 2 && approvedBy !== 'human') {
+    const feasibility = checkFeasibilityGate(2, 3)
+
+    if (!feasibility.passed) {
+      // Create spike tasks if they haven't been created yet
+      if (!feasibility.spikesCreated) {
+        createFeasibilitySpikes(2)
+      }
+
+      broadcastAGUI({
+        type: 'USER_INTERACTION',
+        subtype: 'FEASIBILITY_GATE',
+        phase: currentPhase,
+        status: 'feasibility_required',
+        reason: feasibility.reason,
+        results: feasibility.results,
+      })
+
+      return {
+        advanced: false,
+        reason: `Feasibility gate: ${feasibility.reason}`,
+      }
+    }
+  } else if (currentPhase === 2 && approvedBy === 'human') {
+    // Log human override of feasibility gate
+    logGovernanceEvent({
+      eventType: 'trust_ladder_advancement',
+      details: `Human override: feasibility gate bypassed for Phase 2 -> 3`,
+      severity: 'info',
+    })
   }
 
   // Record human approval

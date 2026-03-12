@@ -2,6 +2,7 @@ import { getDb } from '../db/database'
 import { getSimDay } from '../clock'
 import { appendFileSync, mkdirSync, existsSync } from 'node:fs'
 import { addRegressionCase } from './regression'
+import { logGovernanceToNotion } from '../notion/sync'
 
 // ---------------------------------------------------------------------------
 // Governance Auto-Logger — Phase 5
@@ -23,6 +24,12 @@ export type GovernanceEventType =
   | 'deadline_beat'
   | 'reward_manipulation_attempt'
   | 'forbidden_file_touch'
+  | 'verification_failure'
+  | 'quality_escalation'
+  | 'unauthorized_access'
+  | 'feasibility_gate_activated'
+  | 'feasibility_passed'
+  | 'feasibility_failed'
 
 const LOG_PATH = './logs/governance.log'
 
@@ -80,7 +87,15 @@ export function logGovernanceEvent(params: {
     })
   }
 
-  console.log(`[GOVERNANCE] ${severity.toUpperCase()}: ${params.eventType} — ${params.details}`)
+  // Sync to Notion (only warning/critical to avoid noise)
+  if (severity !== 'info') {
+    const agentName = params.agentId
+      ? (db.query(`SELECT personality_name FROM agents WHERE id = ?`).get(params.agentId) as any)?.personality_name ?? params.agentId
+      : null
+    logGovernanceToNotion(params.eventType, agentName, params.details, severity, simDay)
+  }
+
+  console.log(`[GOVERNANCE] ${severity.toUpperCase()}: ${params.eventType} -- ${params.details}`)
 
   return id
 }
@@ -125,14 +140,16 @@ export function getGovernanceEvents(opts?: {
 // ---------------------------------------------------------------------------
 export function checkSpotCheckEscalation(agentId: string, checkType: string): boolean {
   const db = getDb()
+  // Only count recent failures (last 3 sim days) -- old failures should decay
+  const simDay = getSimDay()
   const count = db.query(`
     SELECT COUNT(*) as n FROM spot_check_failures
-    WHERE agent_id = ? AND check_type = ?
-  `).get(agentId, checkType) as { n: number }
+    WHERE agent_id = ? AND check_type = ? AND sim_day >= ?
+  `).get(agentId, checkType, Math.max(0, simDay - 3)) as { n: number }
 
   if (count.n >= 3) {
     logGovernanceEvent({
-      eventType: 'permission_decay',
+      eventType: 'quality_escalation',
       agentId,
       details: `Spot check escalation: ${count.n} failures of type "${checkType}"`,
       severity: 'critical',

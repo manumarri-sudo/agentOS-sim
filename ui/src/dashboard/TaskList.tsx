@@ -8,7 +8,10 @@ const STATUS_STYLE: Record<string, { color: string; label: string; bg: string }>
   completed: { color: '#98c379', label: 'DONE',       bg: 'rgba(152,195,121,0.06)' },
   proposed_complete: { color: '#e5c07b', label: 'VERIFYING', bg: 'rgba(229,192,123,0.06)' },
   failed:    { color: '#e06c75', label: 'FAILED',     bg: 'rgba(224,108,117,0.06)' },
+  verification_failed: { color: '#e06c75', label: 'V-FAIL', bg: 'rgba(224,108,117,0.05)' },
   cancelled: { color: '#5c6370', label: 'CANCELLED',  bg: 'transparent' },
+  deferred:  { color: '#5c6370', label: 'DEFERRED',   bg: 'transparent' },
+  escalated: { color: '#c678dd', label: 'ESCALATED',  bg: 'rgba(198,120,221,0.06)' },
 }
 
 export function TaskList() {
@@ -18,7 +21,7 @@ export function TaskList() {
   const running  = (tasks ?? []).filter(t => t.status === 'running')
   const queued   = (tasks ?? []).filter(t => t.status === 'queued')
   const completed = (tasks ?? []).filter(t => t.status === 'completed')
-  const failed   = (tasks ?? []).filter(t => t.status === 'failed')
+  const failed   = (tasks ?? []).filter(t => t.status === 'failed' || t.status === 'verification_failed')
 
   return (
     <div className="p-4">

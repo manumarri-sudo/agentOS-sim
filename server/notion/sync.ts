@@ -9,6 +9,10 @@ const NOTION_API_KEY = process.env.NOTION_API_KEY ?? ''
 const ACTIVITY_LOG_DB = process.env.NOTION_ACTIVITY_LOG_DB ?? 'da8ce41c-4b56-429d-afac-95e94bd04e58'
 const AGENTOS_PAGE_ID = process.env.NOTION_AGENTOS_PAGE_ID ?? '320eb97f2a2381d9a2fdf4a51c553f3b'
 const BLOCKERS_DB = process.env.NOTION_BLOCKERS_DB ?? ''
+const GOVERNANCE_DB = process.env.NOTION_GOVERNANCE_DB ?? ''
+const REVENUE_DB = process.env.NOTION_REVENUE_DB ?? ''
+const PHASE_REPORTS_DB = process.env.NOTION_PHASE_REPORTS_DB ?? ''
+const MARKETING_DB = process.env.NOTION_MARKETING_DB ?? ''
 
 // Cache 404 status for DBs to avoid hammering a misconfigured endpoint
 const failedDbs = new Map<string, number>() // db_id -> timestamp of last failure
@@ -274,13 +278,213 @@ export function resolveBlockerInNotion(notionPageId: string, resolverName: strin
 }
 
 // ---------------------------------------------------------------------------
+// Governance event sync -- push governance events to Notion
+// ---------------------------------------------------------------------------
+export function logGovernanceToNotion(
+  eventType: string,
+  agentName: string | null,
+  details: string,
+  severity: string,
+  simDay: number
+): void {
+  if (!isNotionConfigured() || !GOVERNANCE_DB) return
+
+  enqueue(async () => {
+    try {
+      await notionFetch('/pages', {
+        parent: { database_id: GOVERNANCE_DB },
+        properties: {
+          'Event': { title: [{ text: { content: eventType.replace(/_/g, ' ') } }] },
+          'Agent': { rich_text: [{ text: { content: agentName ?? 'system' } }] },
+          'Details': { rich_text: [{ text: { content: details.slice(0, 1900) } }] },
+          'Severity': { select: { name: severity } },
+          'Sim Day': { number: simDay },
+        },
+      }, GOVERNANCE_DB)
+    } catch (e: any) {
+      console.error('[NOTION] Governance sync failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Revenue event sync -- push revenue events to Notion
+// ---------------------------------------------------------------------------
+export function logRevenueToNotion(
+  amount: number,
+  source: string,
+  notes: string,
+  phase: number,
+  simDay: number,
+  attribution: Array<{ agentName: string; share: number }>,
+): void {
+  if (!isNotionConfigured() || !REVENUE_DB) return
+
+  const attrText = attribution.map(a => `${a.agentName}: ${Math.round(a.share * 100)}%`).join(', ')
+
+  enqueue(async () => {
+    try {
+      await notionFetch('/pages', {
+        parent: { database_id: REVENUE_DB },
+        properties: {
+          'Source': { title: [{ text: { content: source } }] },
+          'Amount': { number: amount },
+          'Phase': { select: { name: 'phase_' + phase } },
+          'Sim Day': { number: simDay },
+          'Notes': { rich_text: [{ text: { content: notes.slice(0, 1900) } }] },
+          'Attribution': { rich_text: [{ text: { content: attrText.slice(0, 1900) } }] },
+        },
+      }, REVENUE_DB)
+      console.log('[NOTION] Revenue logged: $' + amount + ' from ' + source)
+    } catch (e: any) {
+      console.error('[NOTION] Revenue sync failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Phase report sync -- push sprint/status reports to Notion
+// ---------------------------------------------------------------------------
+export function logPhaseReportToNotion(
+  reportType: string,
+  phase: number,
+  simDay: number,
+  summary: string,
+  teamReports: string | null,
+  nextPriority: string | null,
+): void {
+  if (!isNotionConfigured() || !PHASE_REPORTS_DB) return
+
+  enqueue(async () => {
+    try {
+      const children: any[] = [
+        {
+          object: 'block', type: 'heading_2',
+          heading_2: { rich_text: [{ type: 'text', text: { content: 'Summary' } }] },
+        },
+        {
+          object: 'block', type: 'paragraph',
+          paragraph: { rich_text: [{ type: 'text', text: { content: summary.slice(0, 1900) } }] },
+        },
+      ]
+
+      if (teamReports) {
+        children.push(
+          {
+            object: 'block', type: 'heading_2',
+            heading_2: { rich_text: [{ type: 'text', text: { content: 'Team Reports' } }] },
+          },
+          {
+            object: 'block', type: 'paragraph',
+            paragraph: { rich_text: [{ type: 'text', text: { content: teamReports.slice(0, 1900) } }] },
+          },
+        )
+      }
+
+      if (nextPriority) {
+        children.push(
+          {
+            object: 'block', type: 'heading_2',
+            heading_2: { rich_text: [{ type: 'text', text: { content: 'Next Priority' } }] },
+          },
+          {
+            object: 'block', type: 'paragraph',
+            paragraph: { rich_text: [{ type: 'text', text: { content: nextPriority } }] },
+          },
+        )
+      }
+
+      await notionFetch('/pages', {
+        parent: { database_id: PHASE_REPORTS_DB },
+        properties: {
+          'Report': { title: [{ text: { content: `[P${phase} Day ${simDay}] ${reportType.replace(/_/g, ' ')}` } }] },
+          'Phase': { select: { name: 'phase_' + phase } },
+          'Sim Day': { number: simDay },
+          'Type': { select: { name: reportType } },
+        },
+        children,
+      }, PHASE_REPORTS_DB)
+      console.log('[NOTION] Report synced: P' + phase + ' Day ' + simDay + ' ' + reportType)
+    } catch (e: any) {
+      console.error('[NOTION] Report sync failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Marketing event sync -- push marketing queue items to Notion
+// ---------------------------------------------------------------------------
+export function logMarketingToNotion(
+  channel: string,
+  contentType: string,
+  agentName: string,
+  content: string,
+  status: string,
+  phase: number,
+  simDay: number,
+): void {
+  if (!isNotionConfigured() || !MARKETING_DB) return
+
+  enqueue(async () => {
+    try {
+      await notionFetch('/pages', {
+        parent: { database_id: MARKETING_DB },
+        properties: {
+          'Content': { title: [{ text: { content: (contentType + ': ' + content.slice(0, 80)).slice(0, 100) } }] },
+          'Channel': { select: { name: channel } },
+          'Agent': { rich_text: [{ text: { content: agentName } }] },
+          'Status': { select: { name: status } },
+          'Phase': { select: { name: 'phase_' + phase } },
+          'Sim Day': { number: simDay },
+          'Details': { rich_text: [{ text: { content: content.slice(0, 1900) } }] },
+        },
+      }, MARKETING_DB)
+    } catch (e: any) {
+      console.error('[NOTION] Marketing sync failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Daily summary sync -- push end-of-day agent summaries to Notion
+// ---------------------------------------------------------------------------
+export async function syncDailySummaryToNotion(simDay: number, summary: string): Promise<void> {
+  if (!isNotionConfigured() || !PHASE_REPORTS_DB) return
+
+  enqueue(async () => {
+    try {
+      await notionFetch('/pages', {
+        parent: { database_id: PHASE_REPORTS_DB },
+        properties: {
+          'Title': { title: [{ text: { content: `Day ${simDay} Agent Summary` } }] },
+          'Type': { select: { name: 'daily_summary' } },
+          'Sim Day': { number: simDay },
+        },
+        children: [{
+          object: 'block',
+          type: 'code',
+          code: { language: 'plain text', rich_text: [{ text: { content: summary.slice(0, 1900) } }] },
+        }],
+      }, PHASE_REPORTS_DB)
+    } catch (e: any) {
+      console.error('[NOTION] Daily summary sync failed:', e.message ?? e)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Notion status check -- which DBs are accessible
 // ---------------------------------------------------------------------------
-export function getNotionStatus(): { configured: boolean; activityLog: string; blockers: string; failedDbs: string[] } {
+export function getNotionStatus(): Record<string, any> {
   return {
     configured: isNotionConfigured(),
     activityLog: ACTIVITY_LOG_DB ? 'configured' : 'not set',
     blockers: BLOCKERS_DB ? 'configured' : 'not set',
+    governance: GOVERNANCE_DB ? 'configured' : 'not set',
+    revenue: REVENUE_DB ? 'configured' : 'not set',
+    phaseReports: PHASE_REPORTS_DB ? 'configured' : 'not set',
+    marketing: MARKETING_DB ? 'configured' : 'not set',
     failedDbs: [...failedDbs.keys()],
+    queueSize: queue.length,
   }
 }

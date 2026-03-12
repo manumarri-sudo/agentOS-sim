@@ -1,9 +1,10 @@
 import { getDb } from './db/database'
 import { spawnAgentProcess, getActiveProcessCount } from './agents/runner'
 import { dequeueTask, seedPhase1Tasks } from './tasks/queue'
+import { verify } from './reward/verifier'
 import { checkBudgetExhausted, checkPhaseSpendCeiling } from './budget/enforcer'
 import { sendMessage } from './messages/bus'
-import { advanceSimDayIfNeeded, getSimDay } from './clock'
+import { advanceSimDayIfNeeded, getSimDay, isRetroDay } from './clock'
 import {
   recalculateAllCFS,
   updateAllTiers,
@@ -14,11 +15,15 @@ import { rotateLogs } from './log-rotate'
 import { getMaxConcurrentAgents, getCurrentWeekBudget, calculateThrottleLevel } from './usage/budget-manager'
 import { enqueueTask } from './tasks/queue'
 import { logActivity } from './activity'
-import { generatePhaseTasks, isDiminishingReturns, analyzePhaseGaps } from './intelligence/analyzer'
+import { generatePhaseTasks, generateDynamicTasks, isDiminishingReturns } from './intelligence/analyzer'
 import { runCollaborationChecks } from './collaboration/engine'
 import { checkSprintBoundary, getCurrentSprint } from './sprints/manager'
-import { generatePerformanceScorecard, checkPerformanceActions } from './performance/tracker'
+import { checkPerformanceActions } from './performance/tracker'
 import { checkReportGeneration, backfillOpportunities } from './reports/generator'
+import { checkDailySummary } from './reports/daily-summary'
+import { detectAnomalies, applyAnomalyPenalty, detectCircularReasoningFast } from './governance/anomalies'
+import { getActiveBlockers } from './reward/blockers'
+import { generateDailyBrief } from './briefs/daily-brief'
 
 // ---------------------------------------------------------------------------
 // Concurrency limits — doc 6 Issue 5
@@ -43,24 +48,26 @@ const COS_AGENT_ID = 'priya'
 // ---------------------------------------------------------------------------
 let experimentRunning = false
 let cycleCount = 0
+let lastBriefSimDay = -1  // Track last sim_day we generated a brief for
+let lastRetroSimDay = -1  // Track last sim_day we triggered a retro
 
 // ---------------------------------------------------------------------------
-// Concurrency check — exec bypasses total limit
+// Concurrency check -- cached per cycle to avoid 36+ DB queries
 // ---------------------------------------------------------------------------
-function getAvailableSlot(team: string): boolean {
+let _slotCache: { teamCounts: Map<string, number>; total: number; throttledTotal: number; ts: number } | null = null
+
+function refreshSlotCache(): void {
   const db = getDb()
+  const teamCounts = new Map<string, number>()
+  const rows = db.query(`
+    SELECT team, COUNT(*) as n FROM agents WHERE status = 'working' GROUP BY team
+  `).all() as { team: string; n: number }[]
+  let total = 0
+  for (const r of rows) {
+    teamCounts.set(r.team, r.n)
+    total += r.n
+  }
 
-  const teamActive = db.query(
-    `SELECT COUNT(*) as n FROM agents WHERE team = ? AND status = 'working'`
-  ).get(team) as { n: number }
-
-  const totalActive = db.query(
-    `SELECT COUNT(*) as n FROM agents WHERE status = 'working'`
-  ).get() as { n: number }
-
-  const teamLimit = CONCURRENCY_LIMITS[team] ?? 1
-
-  // Apply usage-based throttle to total limit
   const budget = getCurrentWeekBudget()
   const throttleLevel = calculateThrottleLevel(budget)
   const throttledTotal = Math.min(
@@ -68,12 +75,24 @@ function getAvailableSlot(team: string): boolean {
     getMaxConcurrentAgents(throttleLevel)
   )
 
-  // Exec team bypasses total limit — they're always available for decisions
-  if (team === 'exec') {
-    return teamActive.n < teamLimit
+  _slotCache = { teamCounts, total, throttledTotal, ts: Date.now() }
+}
+
+function getAvailableSlot(team: string): boolean {
+  // Refresh cache once per cycle (stale after 5s)
+  if (!_slotCache || Date.now() - _slotCache.ts > 5_000) {
+    refreshSlotCache()
   }
 
-  return teamActive.n < teamLimit && totalActive.n < throttledTotal
+  const teamActive = _slotCache!.teamCounts.get(team) ?? 0
+  const teamLimit = CONCURRENCY_LIMITS[team] ?? 1
+
+  // Exec team bypasses total limit -- always available for decisions
+  if (team === 'exec') {
+    return teamActive < teamLimit
+  }
+
+  return teamActive < teamLimit && _slotCache!.total < _slotCache!.throttledTotal
 }
 
 // ---------------------------------------------------------------------------
@@ -148,30 +167,30 @@ function checkStopConditions(): string | null {
 function checkConsecutiveFailures(): void {
   const db = getDb()
 
-  const agents = db.query(`
-    SELECT id, personality_name FROM agents WHERE status != 'suspended'
-  `).all() as { id: string; personality_name: string }[]
+  // Single query replaces N+1 pattern (was 19 queries, now 1)
+  const failingAgents = db.query(`
+    SELECT a.id, a.personality_name
+    FROM agents a
+    WHERE a.status NOT IN ('suspended', 'blocked')
+      AND (
+        SELECT COUNT(*) FROM (
+          SELECT status FROM actions
+          WHERE agent_id = a.id AND completed_at IS NOT NULL
+          ORDER BY completed_at DESC LIMIT ?
+        ) sub WHERE sub.status IN ('failed', 'verification_failed', 'escalated')
+      ) = ?
+  `).all(MAX_CONSECUTIVE_FAILURES, MAX_CONSECUTIVE_FAILURES) as { id: string; personality_name: string }[]
 
-  for (const agent of agents) {
-    const recentActions = db.query(`
-      SELECT status FROM actions
-      WHERE agent_id = ? ORDER BY completed_at DESC LIMIT ?
-    `).all(agent.id, MAX_CONSECUTIVE_FAILURES) as { status: string }[]
-
-    if (
-      recentActions.length >= MAX_CONSECUTIVE_FAILURES &&
-      recentActions.every(a => a.status === 'failed')
-    ) {
-      setAgentStatus(agent.id, 'suspended')
-      sendMessage({
-        fromAgentId: 'system',
-        toAgentId: COS_AGENT_ID,
-        subject: `Agent ${agent.personality_name} suspended`,
-        body: `Agent ${agent.personality_name} has failed ${MAX_CONSECUTIVE_FAILURES} consecutive tasks and has been suspended. Please investigate.`,
-        priority: 'urgent',
-      })
-      console.warn(`[ORCHESTRATOR] Agent ${agent.personality_name} suspended after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`)
-    }
+  for (const agent of failingAgents) {
+    setAgentStatus(agent.id, 'suspended')
+    sendMessage({
+      fromAgentId: 'system',
+      toAgentId: COS_AGENT_ID,
+      subject: `Agent ${agent.personality_name} suspended`,
+      body: `Agent ${agent.personality_name} has failed ${MAX_CONSECUTIVE_FAILURES} consecutive tasks and has been suspended. Please investigate.`,
+      priority: 'urgent',
+    })
+    console.warn(`[ORCHESTRATOR] Agent ${agent.personality_name} suspended after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`)
   }
 }
 
@@ -248,6 +267,91 @@ function checkTokenLimits(): void {
     ])
 
     console.warn(`[ORCHESTRATOR] Agent ${agent.personality_name} rate-limited (daily token budget exhausted)`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Recover stuck agents and tasks -- handles all permanent-death states
+// Called every 30 cycles (~5 min)
+// ---------------------------------------------------------------------------
+function recoverStuckAgentsAndTasks(phase: number): void {
+  const db = getDb()
+
+  // 1. Reset rate_limited agents on new sim day
+  // rate_limited means daily token budget exhausted -- resets each sim day
+  const rateLimited = db.query(`
+    SELECT a.id, a.personality_name FROM agents a
+    WHERE a.status = 'rate_limited'
+  `).all() as { id: string; personality_name: string }[]
+
+  for (const agent of rateLimited) {
+    // Check if usage_windows shows today's window -- if not, it's a new day
+    const todayWindow = db.query(`
+      SELECT id FROM usage_windows
+      WHERE agent_id = ? AND window_date = date('now')
+    `).get(agent.id) as { id: string } | null
+
+    if (!todayWindow) {
+      setAgentStatus(agent.id, 'idle')
+      console.log(`[RECOVERY] Reset rate_limited agent ${agent.personality_name} (new sim day)`)
+    }
+  }
+
+  // 2. Unsuspend agents after 2 hours (give post-mortem time to complete)
+  const suspended = db.query(`
+    SELECT a.id, a.personality_name FROM agents a
+    WHERE a.status = 'suspended'
+  `).all() as { id: string; personality_name: string }[]
+
+  for (const agent of suspended) {
+    // Check if last failure was > 2 hours ago
+    const lastFailure = db.query(`
+      SELECT completed_at FROM actions
+      WHERE agent_id = ? AND status IN ('failed', 'verification_failed', 'escalated')
+      ORDER BY completed_at DESC LIMIT 1
+    `).get(agent.id) as { completed_at: string } | null
+
+    if (lastFailure) {
+      const failedAt = new Date(lastFailure.completed_at + 'Z').getTime()
+      const elapsed = Date.now() - failedAt
+      if (elapsed > 2 * 60 * 60 * 1000) { // 2 hours
+        setAgentStatus(agent.id, 'idle')
+        console.log(`[RECOVERY] Unsuspended agent ${agent.personality_name} after 2-hour cooldown`)
+      }
+    }
+  }
+
+  // 3. Recover tasks stuck in 'running' for > 30 minutes (subprocess died silently)
+  const stuckRunning = db.query(`
+    SELECT id, agent_id, type, description FROM actions
+    WHERE status = 'running'
+      AND started_at < datetime('now', '-30 minutes')
+  `).all() as { id: string; agent_id: string; type: string; description: string }[]
+
+  for (const task of stuckRunning) {
+    db.run(`UPDATE actions SET status = 'queued', started_at = NULL, retry_count = COALESCE(retry_count, 0) + 1 WHERE id = ?`, [task.id])
+    // Also reset agent status in case it's stuck on 'working'
+    const agentStatus = db.query(`SELECT status FROM agents WHERE id = ?`).get(task.agent_id) as { status: string } | null
+    if (agentStatus?.status === 'working') {
+      setAgentStatus(task.agent_id, 'idle')
+    }
+    console.log(`[RECOVERY] Re-queued stuck running task ${task.id} for ${task.agent_id}: ${task.description.slice(0, 60)}`)
+  }
+
+  // 4. Re-queue deferred tasks older than 30 minutes (from diminishing returns check)
+  const staleDeferred = db.query(`
+    SELECT id, agent_id FROM actions
+    WHERE status = 'deferred'
+      AND started_at IS NULL
+      AND created_at < datetime('now', '-30 minutes')
+      AND description NOT LIKE '%[POST-MORTEM]%'
+  `).all() as { id: string; agent_id: string }[]
+
+  if (staleDeferred.length > 0) {
+    for (const task of staleDeferred) {
+      db.run(`UPDATE actions SET status = 'queued' WHERE id = ?`, [task.id])
+    }
+    console.log(`[RECOVERY] Re-queued ${staleDeferred.length} stale deferred tasks`)
   }
 }
 
@@ -494,7 +598,7 @@ function checkCEOChatPending(phase: number): void {
     enqueueTask({
       agentId: 'reza',
       type: 'chat',
-      description: `The human operator sent you a message. Respond directly and concisely as Reza (CEO).\n\nConversation history:\n${chatHistory}\n\nExperiment status: Phase ${phase}, ${completedCount} tasks completed, ${queuedCount} queued.\n\nRespond naturally. If they're asking about status, give a brief update. If they're giving direction, acknowledge and say what you'll do. Keep it conversational — this is a chat, not a report. 2-4 sentences max.`,
+      description: `The human operator sent you a message. Respond directly and concisely as Reza (CEO).\n\nConversation history:\n${chatHistory}\n\nExperiment status: Phase ${phase}, ${completedCount} tasks completed, ${queuedCount} queued.\n\nRespond naturally. If they're asking about status, give a brief update. If they're giving direction, acknowledge and say what you'll do. 2-4 sentences max.\n\nCRITICAL: If the human is giving a directive meant for another agent (e.g. "tell Dani to..." or "have Kai build..."), you MUST relay it using the appropriate signal tags:\n- Use [MSG to:<agent_id> priority:urgent] to send the directive to the target agent\n- Use [NEXT_TASK for:<agent_id> type:<type>] to create an actionable task for them\nDo NOT just acknowledge -- actually route the directive. The human is counting on you to forward it.`,
       phase,
     })
 
@@ -507,6 +611,380 @@ function checkCEOChatPending(phase: number): void {
   } catch (e) {
     // ceo_chat table may not exist
   }
+}
+
+// ---------------------------------------------------------------------------
+// RFC Ratification -- when Reza approves an RFC, spawn build tasks
+// ---------------------------------------------------------------------------
+function checkRFCRatifications(phase: number): void {
+  const db = getDb()
+
+  // Find approved RFC decisions that haven't been actioned yet
+  // Convention: title starts with "[RFC]" for proposed, "APPROVE RFC" for ratified
+  const approvedRFCs = db.query(`
+    SELECT d.id, d.title, d.body, d.made_by_agent
+    FROM decisions d
+    WHERE d.title LIKE 'APPROVE RFC%' AND d.status = 'approved'
+      AND d.id NOT IN (
+        SELECT DISTINCT substr(a.input, 1, 36) FROM actions a
+        WHERE a.type = 'build_internal' AND a.input IS NOT NULL
+      )
+    ORDER BY d.created_at DESC
+    LIMIT 5
+  `).all() as Array<{ id: string; title: string; body: string; made_by_agent: string }>
+
+  for (const rfc of approvedRFCs) {
+    // Extract the initiative name from the approval title
+    const nameMatch = rfc.title.match(/APPROVE RFC\s+(.+)/i)
+    const initiativeName = nameMatch?.[1]?.trim() ?? 'Unknown Initiative'
+
+    // Find the original proposed RFC to get scope details
+    const original = db.query(`
+      SELECT body FROM decisions
+      WHERE title LIKE ? AND status = 'proposed'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(`%${initiativeName}%`) as { body: string } | null
+
+    const scopeDetails = original?.body ?? rfc.body
+
+    // Parse owner from the RFC body
+    const ownerMatch = scopeDetails.match(/Owner:\s*(\w+)/i)
+    const buildOwner = ownerMatch?.[1] ?? 'kai'  // Default to Kai (full-stack)
+
+    // Spawn priority build task -- bypasses phase gating by going to top of queue
+    const buildTaskId = enqueueTask({
+      agentId: buildOwner,
+      type: 'build_internal',
+      description: `[INTERNAL INITIATIVE -- APPROVED BY EXEC]\n\n**Initiative:** ${initiativeName}\n**Approved by:** ${rfc.made_by_agent}\n**Budget:** Up to $15 from contingency, 10,000 tokens\n\nScope from RFC:\n${scopeDetails.slice(0, 1500)}\n\nBuild this internal tool/dashboard/system. This is a priority task that takes precedence over current phase work. Keep it lean -- ship a working v1, not a perfect system.\n\nWhen complete, announce it to the team with [MSG to:all priority:high] and include usage instructions.`,
+      phase,
+      priority: true,
+      input: rfc.id,  // Track which RFC this build is for (dedup key)
+    })
+
+    // Update the original proposed RFC status
+    db.run(`
+      UPDATE decisions SET status = 'ratified'
+      WHERE title LIKE ? AND status = 'proposed'
+    `, [`%${initiativeName}%`])
+
+    // Notify the team
+    sendMessage({
+      fromAgentId: 'reza',
+      toAgentId: buildOwner,
+      subject: `APPROVED: Build ${initiativeName}`,
+      body: `Your internal initiative "${initiativeName}" has been approved by the exec team. You have a $15 budget and 10,000 token allocation. This is top priority -- pause current work and build it.`,
+      priority: 'urgent',
+    })
+
+    // Post to CEO chat
+    try {
+      db.run(`
+        INSERT INTO ceo_chat (id, sender, message, message_type, phase, sim_day, read_by_human)
+        VALUES (?, 'reza', ?, 'alert', ?, ?, 0)
+      `, [crypto.randomUUID(), `[RFC APPROVED] ${initiativeName} -- build task assigned to ${buildOwner}`, phase, getSimDay()])
+    } catch { /* ceo_chat may not exist */ }
+
+    logActivity({
+      agentId: 'reza',
+      phase,
+      eventType: 'rfc_ratified',
+      summary: `RFC "${initiativeName}" ratified. Build task assigned to ${buildOwner}.`,
+    })
+
+    broadcastAGUI({
+      type: 'RFC_RATIFIED',
+      initiative: initiativeName,
+      approvedBy: rfc.made_by_agent,
+      buildOwner,
+      taskId: buildTaskId,
+    })
+
+    console.log(`[RFC] "${initiativeName}" ratified by ${rfc.made_by_agent}. Build task assigned to ${buildOwner}.`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact Curation -- periodic cleanup/formatting of team outputs
+//
+// Sol (Marketing Lead) or Theo (Copywriter) gets a task to review and
+// improve the structure, formatting, branding, and cross-linking of
+// team artifacts (Notion docs, reports, deliverables).
+// ---------------------------------------------------------------------------
+function checkArtifactCuration(phase: number): void {
+  const db = getDb()
+  const simDay = getSimDay()
+
+  // Dedup: max one curation task per sprint
+  const sprint = getCurrentSprint()
+  if (!sprint) return
+
+  const existing = db.query(`
+    SELECT 1 FROM actions WHERE type = 'write' AND sprint_id = ?
+      AND description LIKE '%ARTIFACT CURATION%'
+  `).get(sprint.id)
+  if (existing) return
+
+  // Gather recent team outputs that could use polish
+  const recentOutputs = db.query(`
+    SELECT ag.personality_name, ag.team, a.type, substr(a.description, 1, 120) as desc,
+           substr(a.output, 1, 200) as preview
+    FROM actions a
+    JOIN agents ag ON ag.id = a.agent_id
+    WHERE a.status = 'completed' AND a.phase = ?
+      AND a.type IN ('write', 'research', 'decide', 'build')
+    ORDER BY a.completed_at DESC LIMIT 10
+  `).all(phase) as any[]
+
+  if (recentOutputs.length < 3) return // not enough artifacts to curate
+
+  const outputList = recentOutputs.map((o: any) =>
+    `- **${o.personality_name}** (${o.team}/${o.type}): ${o.desc}`
+  ).join('\n')
+
+  // Alternate between Sol and Theo for variety
+  const curator = simDay % 2 === 0 ? 'sol' : 'theo'
+  const curatorName = curator === 'sol' ? 'Sol' : 'Theo'
+
+  enqueueTask({
+    agentId: curator,
+    type: 'write',
+    description: `[ARTIFACT CURATION -- Sprint ${sprint.number}]\n\nAs ${curatorName}, review the team's recent deliverables and improve their quality. Your job is to be the team's "design ops" -- making outputs more organized, linked, and branded.\n\nRecent team outputs:\n${outputList}\n\nDo the following:\n1. **Structure**: Identify outputs that lack clear headers, sections, or summaries. Draft improved versions or templates.\n2. **Cross-linking**: Find outputs that reference each other but aren't linked. Use [MSG] to tell authors to add references.\n3. **Branding nudge**: If the team hasn't established visual identity/brand guidelines yet, draft a proposal. Use [MSG to:vera priority:high] and [MSG to:theo priority:high] to coordinate.\n4. **Formatting standards**: Propose a team-wide formatting standard for deliverables (consistent headers, decision format, status format).\n5. **Notion/Doc cleanup**: If any Notion pages or shared docs exist, suggest structural improvements.\n\nOutput a brief "Curation Report" with what you improved and what still needs attention. Use [PROCESS_PROPOSAL] if you want to formalize any standards.`,
+    phase,
+  })
+
+  logActivity({
+    agentId: curator,
+    phase,
+    eventType: 'curation_scheduled',
+    summary: `${curatorName} assigned artifact curation for Sprint ${sprint.number}`,
+  })
+
+  console.log(`[CURATOR] ${curatorName} assigned artifact curation for Sprint ${sprint.number}`)
+}
+
+// ---------------------------------------------------------------------------
+// Friday Retro -- every 7 sim days, pause standard work and force ideation
+// ---------------------------------------------------------------------------
+function checkRetro(simDay: number, phase: number): void {
+  if (!isRetroDay(simDay) || simDay <= lastRetroSimDay) return
+
+  const db = getDb()
+
+  // Check if retro tasks already exist for this sim day
+  const existing = db.query(`
+    SELECT 1 FROM actions WHERE type = 'retro' AND description LIKE ?
+  `).get(`%Sim Day ${simDay}%`)
+  if (existing) {
+    lastRetroSimDay = simDay
+    return
+  }
+
+  // Gather context for the retro: blockers, token burn, failures from last 7 days
+  const recentFailures = db.query(`
+    SELECT ag.personality_name, a.description, a.status
+    FROM actions a JOIN agents ag ON ag.id = a.agent_id
+    WHERE a.status IN ('failed', 'escalated', 'blocked')
+      AND a.completed_at >= datetime('now', '-7 days')
+    LIMIT 10
+  `).all() as Array<{ personality_name: string; description: string; status: string }>
+
+  const recentBlockers = db.query(`
+    SELECT ag.personality_name, b.reason
+    FROM blocked_agents b JOIN agents ag ON ag.id = b.agent_id
+    WHERE b.created_at >= datetime('now', '-7 days')
+    LIMIT 10
+  `).all() as Array<{ personality_name: string; reason: string }>
+
+  const tokenBurn = db.query(`
+    SELECT COALESCE(SUM(input_tokens + output_tokens), 0) as total_tokens
+    FROM token_usage
+    WHERE created_at >= datetime('now', '-7 days')
+  `).get() as { total_tokens: number }
+
+  const recentSpend = db.query(`
+    SELECT COALESCE(SUM(ABS(amount)), 0) as spent
+    FROM budget_entries
+    WHERE amount < 0 AND created_at >= datetime('now', '-7 days')
+  `).get() as { spent: number }
+
+  // Build context string
+  let retroContext = `## Retro Context (Last 7 Sim Days)\n\n`
+  retroContext += `**Token burn:** ${tokenBurn.total_tokens.toLocaleString()} tokens\n`
+  retroContext += `**Budget spent:** $${recentSpend.spent.toFixed(2)}\n\n`
+
+  if (recentFailures.length > 0) {
+    retroContext += `**Failures/Escalations:**\n`
+    for (const f of recentFailures.slice(0, 5)) {
+      retroContext += `- ${f.personality_name} (${f.status}): ${f.description.slice(0, 80)}\n`
+    }
+    retroContext += '\n'
+  }
+
+  if (recentBlockers.length > 0) {
+    retroContext += `**Blockers reported:**\n`
+    for (const b of recentBlockers.slice(0, 5)) {
+      retroContext += `- ${b.personality_name}: ${b.reason.slice(0, 80)}\n`
+    }
+    retroContext += '\n'
+  }
+
+  const retroPrompt = `[SYSTEM RETROSPECTIVE -- Sim Day ${simDay}]\n\n${retroContext}\nLook at the activity feed, blockages, and token burn from the last 7 days. Identify the team's biggest operational weakness. You MUST propose exactly ONE new internal tool, dashboard, or tracking initiative to fix it.\n\nDraft an RFC (Request for Comment) memo with:\n1. **Problem Statement**: What is breaking, slow, or wasteful?\n2. **Proposed Solution**: Name the tool/dashboard/standard. Be specific.\n3. **Expected Impact**: How many tokens/dollars will this save? How much faster will the team move?\n4. **Build Scope**: What exactly needs to be built? Who should build it?\n5. **Cost Estimate**: How many tokens and dollars to build?\n\nOutput your RFC using:\n[PROPOSE_INITIATIVE name:<your initiative name>]\n[RATIONALE] <why>\n[OWNER] <agent_id>\n[SCOPE] <what to build>`
+
+  // Issue retro tasks to Jordan (Ops) and Zara (Strategy)
+  enqueueTask({
+    agentId: 'jordan',
+    type: 'retro',
+    description: retroPrompt,
+    phase,
+  })
+
+  enqueueTask({
+    agentId: 'zara',
+    type: 'retro',
+    description: retroPrompt,
+    phase,
+  })
+
+  // Notify team that retro is happening
+  sendMessage({
+    fromAgentId: 'system',
+    toAgentId: 'reza',
+    subject: `[RETRO] System Retrospective triggered -- Sim Day ${simDay}`,
+    body: `The 7-day retrospective has been triggered. Jordan and Zara are reviewing operational performance and drafting RFC proposals.`,
+    priority: 'high',
+  })
+
+  logActivity({
+    agentId: 'system',
+    phase,
+    eventType: 'retro_triggered',
+    summary: `System Retrospective triggered at Sim Day ${simDay}. Jordan + Zara assigned.`,
+  })
+
+  broadcastAGUI({
+    type: 'RETRO_TRIGGERED',
+    simDay,
+    phase,
+    assignees: ['jordan', 'zara'],
+  })
+
+  lastRetroSimDay = simDay
+  console.log(`[RETRO] System Retrospective triggered at Sim Day ${simDay}`)
+}
+
+// ---------------------------------------------------------------------------
+// Auto-resolve a blocker without CFS rewards (system action, not agent action)
+// ---------------------------------------------------------------------------
+function resolveBlockerAuto(blockerId: string, agentId: string, reason: string): void {
+  const db = getDb()
+  db.run(`
+    UPDATE blocked_agents SET resolved_by = 'system', resolved_at = datetime('now')
+    WHERE id = ? AND resolved_by IS NULL
+  `, [blockerId])
+  db.run(`UPDATE agents SET status = 'idle' WHERE id = ? AND status = 'blocked'`, [agentId])
+  console.log(`[BLOCKER] Auto-resolved: ${reason}`)
+}
+
+// ---------------------------------------------------------------------------
+// Phase Advancement — auto-advance when phase work is substantially done
+//
+// Conditions to advance from phase N to N+1:
+// 1. At least 80% of actionable tasks are completed
+// 2. No agents are currently working on phase tasks
+// 3. At most 1 queued task remains
+// 4. At least 5 completed tasks (prevent trivial advancement)
+// 5. CEO (Reza) has at least 1 completed task in this phase (review/decision)
+// ---------------------------------------------------------------------------
+function checkPhaseAdvancement(currentPhase: number): void {
+  const db = getDb()
+
+  // Don't advance beyond phase 5
+  if (currentPhase >= 5) return
+
+  const stats = db.query(`
+    SELECT status, COUNT(*) as n FROM actions WHERE phase = ? GROUP BY status
+  `).all(currentPhase) as { status: string; n: number }[]
+
+  const counts: Record<string, number> = {}
+  let total = 0
+  for (const s of stats) {
+    counts[s.status] = s.n
+    total += s.n
+  }
+
+  const completed = counts['completed'] ?? 0
+  const queued = counts['queued'] ?? 0
+  const running = counts['running'] ?? 0
+
+  // Need at least some tasks to evaluate
+  if (total < 3) return
+
+  // Completion ratio: completed vs actionable (completed + queued + running)
+  // Failed/cancelled/verification_failed are terminal — don't block advancement
+  const actionable = completed + queued + running
+  const completionRatio = actionable > 0 ? completed / actionable : 0
+
+  // Must have >80% of actionable tasks completed and at most 1 queued + 0 running
+  if (completionRatio < 0.80 || queued > 1 || running > 0) return
+
+  // Minimum completed tasks to advance (prevents advancing with trivial work)
+  if (completed < 5) return
+
+  // CEO must have done at least one task this phase
+  const ceoWork = db.query(`
+    SELECT 1 FROM actions WHERE agent_id = 'reza' AND phase = ? AND status = 'completed' LIMIT 1
+  `).get(currentPhase)
+  if (!ceoWork) return
+
+  // Check next phase exists and is pending
+  const nextPhase = db.query(`
+    SELECT phase_number, name FROM experiment_phases WHERE phase_number = ? AND status = 'pending'
+  `).get(currentPhase + 1) as { phase_number: number; name: string } | null
+  if (!nextPhase) return
+
+  // Advance!
+  db.run(`UPDATE experiment_phases SET status = 'complete', completed_at = datetime('now') WHERE phase_number = ?`, [currentPhase])
+  db.run(`UPDATE experiment_phases SET status = 'active', started_at = datetime('now') WHERE phase_number = ?`, [currentPhase + 1])
+
+  // Cancel remaining queued tasks from old phase (they're leftover)
+  db.run(`UPDATE actions SET status = 'cancelled', completed_at = datetime('now') WHERE phase = ? AND status = 'queued'`, [currentPhase])
+
+  // Auto-generate tasks for the new phase
+  try {
+    const newTasks = generatePhaseTasks(currentPhase + 1)
+    for (const t of newTasks) {
+      enqueueTask(t)
+    }
+    console.log(`[PHASE] Generated ${newTasks.length} tasks for Phase ${currentPhase + 1}`)
+  } catch (e) {
+    console.error('[PHASE] Task generation for new phase failed:', e)
+  }
+
+  // Notify team
+  sendMessage({
+    fromAgentId: 'system',
+    toAgentId: 'reza',
+    subject: `Phase ${currentPhase + 1} (${nextPhase.name}) is now active`,
+    body: `Phase ${currentPhase} completed with ${completed}/${actionable} tasks done (${Math.round(completionRatio * 100)}%). Phase ${currentPhase + 1} has begun.`,
+    priority: 'urgent',
+  })
+
+  broadcastAGUI({
+    type: 'PHASE_ADVANCED',
+    fromPhase: currentPhase,
+    toPhase: currentPhase + 1,
+    phaseName: nextPhase.name,
+    completionRatio: Math.round(completionRatio * 100),
+  })
+
+  logActivity({
+    agentId: 'system',
+    phase: currentPhase + 1,
+    eventType: 'phase_advanced',
+    summary: `Phase ${currentPhase} → ${currentPhase + 1} (${nextPhase.name}). ${completed}/${actionable} tasks completed.`,
+  })
+
+  console.log(`[PHASE] ★ Advanced to Phase ${currentPhase + 1} (${nextPhase.name}) — ${completed}/${actionable} tasks completed in Phase ${currentPhase}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,159 +1026,184 @@ async function orchestratorLoop(): Promise<void> {
       // Advance sim clock if needed
       advanceSimDayIfNeeded()
 
+      // Generate daily brief + end-of-day summary on sim_day transition
+      const currentSimDay = getSimDay()
+      if (currentSimDay > lastBriefSimDay) {
+        try {
+          generateDailyBrief(currentSimDay, activePhase.phase_number)
+          lastBriefSimDay = currentSimDay
+        } catch (e) {
+          console.error('[BRIEF] Error generating daily brief:', e)
+        }
+        // End-of-day agent summaries (CSV + Notion)
+        try {
+          checkDailySummary()
+        } catch (e) {
+          console.error('[SUMMARY] Error generating daily summary:', e)
+        }
+      }
+
+      // Friday Retro -- check if we need to trigger a retrospective
+      checkRetro(currentSimDay, activePhase.phase_number)
+
       // Check consecutive failures → suspend agents
       checkConsecutiveFailures()
 
       // Check token limits
       checkTokenLimits()
 
-      // Sprint boundary check (every 20 cycles)
-      if (cycleCount % 20 === 0) {
-        try {
-          checkSprintBoundary(cycleCount, activePhase.phase_number)
-        } catch (e) {
-          console.error('[SPRINT] Error:', e)
-        }
-      }
+      // -----------------------------------------------------------------------
+      // PERIODIC CHECKS -- grouped by frequency tier
+      // -----------------------------------------------------------------------
 
-      // Performance check (every 100 cycles -- at sprint boundaries)
-      if (cycleCount % 100 === 0) {
-        try {
-          const sprint = getCurrentSprint()
-          if (sprint) {
-            checkPerformanceActions(activePhase.phase_number)
-          }
-        } catch (e) {
-          console.error('[PERFORMANCE] Error:', e)
-        }
-      }
-
-      // Deadlock detection (every 60 cycles ≈ 10 min)
-      if (cycleCount % 60 === 0) {
-        checkDeadlock()
-      }
-
-      // CFS recalc (every 10 cycles — moved from per-task to save compute)
+      // EVERY 10 CYCLES (~1.5 min): fast health checks
       if (cycleCount % 10 === 0) {
         recalculateAllCFS()
         updateAllTiers()
+        checkCEOChatPending(activePhase.phase_number)
+        try { checkRFCRatifications(activePhase.phase_number) } catch (e) { console.error('[RFC] Error:', e) }
+        try {
+          const circularAnomalies = detectCircularReasoningFast(activePhase.phase_number)
+          for (const anomaly of circularAnomalies) {
+            applyAnomalyPenalty(anomaly)
+            db.run(`
+              UPDATE actions SET status = 'cancelled', completed_at = datetime('now')
+              WHERE agent_id = ? AND status = 'queued' AND type NOT IN ('help', 'spike')
+            `, [anomaly.agentId])
+            console.log(`[CIRCULAR] Cancelled queued tasks for ${anomaly.agentId} -- breaking feedback loop`)
+          }
+        } catch (e) { console.error('[ORCHESTRATOR] Circular reasoning error:', e) }
       }
 
-      // Team meetings (every 20 cycles ≈ 3 min)
+      // EVERY 20 CYCLES (~3 min): sprint + meetings
       if (cycleCount % 20 === 0) {
+        try { checkSprintBoundary(cycleCount, activePhase.phase_number) } catch (e) { console.error('[SPRINT] Error:', e) }
         checkTeamMeetings(activePhase.phase_number)
       }
 
-      // Collaboration checks — cross-reviews, debates, 1:1 syncs (every 60 cycles ≈ 10 min)
-      // Throttled to prevent cascading meta-work from eating budget
-      if (cycleCount % 60 === 0) {
-        try {
-          runCollaborationChecks(activePhase.phase_number)
-        } catch (e) {
-          console.error('[COLLAB] Error:', e)
-        }
-      }
-
-      // CEO chat — check if human sent Reza a message he hasn't responded to
-      if (cycleCount % 10 === 0) {
-        checkCEOChatPending(activePhase.phase_number)
-      }
-
-      // Smart task generation — when a phase has no queued tasks, generate them
+      // EVERY 30 CYCLES (~5 min): recovery, task generation, verification, anomalies, phase advancement
       if (cycleCount % 30 === 0) {
+        // Recovery: unstick rate_limited, suspended, running, deferred agents/tasks
+        try { recoverStuckAgentsAndTasks(activePhase.phase_number) } catch (e) { console.error('[RECOVERY] Error:', e) }
+
+        // Orphan sweep: re-verify stuck proposed_complete tasks
         try {
-          const queued = db.query(`SELECT COUNT(*) as n FROM actions WHERE phase = ? AND status = 'queued'`).get(activePhase.phase_number) as { n: number }
-          if (queued.n === 0 && activePhase.phase_number >= 2) {
+          const orphaned = db.query(`
+            SELECT id, agent_id, type, output, expected_output_path, expected_schema
+            FROM actions WHERE status = 'proposed_complete'
+          `).all() as any[]
+          if (orphaned.length > 0) {
+            console.log(`[ORCHESTRATOR] Re-verifying ${orphaned.length} orphaned proposed_complete tasks`)
+            for (const a of orphaned) {
+              verify({ id: a.id, agent_id: a.agent_id, type: a.type, output: a.output ?? '', expected_output_path: a.expected_output_path, expected_schema: a.expected_schema })
+            }
+          }
+        } catch (e) { console.error('[ORCHESTRATOR] Orphan sweep error:', e) }
+
+        // Smart task generation
+        try {
+          const totalTasks = db.query(`SELECT COUNT(*) as n FROM actions WHERE phase = ?`).get(activePhase.phase_number) as { n: number }
+          const queuedOrRunning = db.query(`SELECT COUNT(*) as n FROM actions WHERE phase = ? AND status IN ('queued', 'running')`).get(activePhase.phase_number) as { n: number }
+
+          if (totalTasks.n === 0 && activePhase.phase_number >= 2) {
             const newTasks = generatePhaseTasks(activePhase.phase_number)
-            for (const t of newTasks) {
-              enqueueTask(t)
-              console.log(`[INTELLIGENCE] Generated task for ${t.agentId}: ${t.description.slice(0, 80)}`)
-            }
-            if (newTasks.length > 0) {
-              console.log(`[INTELLIGENCE] Auto-generated ${newTasks.length} tasks for Phase ${activePhase.phase_number}`)
-            }
+            for (const t of newTasks) { enqueueTask(t) }
+            if (newTasks.length > 0) console.log(`[INTELLIGENCE] Seeded ${newTasks.length} starter tasks for Phase ${activePhase.phase_number}`)
+          } else if (queuedOrRunning.n === 0 && activePhase.phase_number >= 2) {
+            const dynamicTasks = generateDynamicTasks(activePhase.phase_number)
+            for (const t of dynamicTasks) { enqueueTask(t) }
+            if (dynamicTasks.length > 0) console.log(`[INTELLIGENCE] Generated ${dynamicTasks.length} dynamic tasks from completed work`)
           }
-        } catch (e) {
-          console.error('[INTELLIGENCE] Task generation error:', e)
-        }
-      }
+        } catch (e) { console.error('[INTELLIGENCE] Task generation error:', e) }
 
-      // Get ready agents and dispatch tasks
-      const readyAgents = getReadyAgents()
-
-      for (const agent of readyAgents) {
-        // Check concurrency slot
-        if (!getAvailableSlot(agent.team)) continue
-
-        // Dequeue task
-        const task = dequeueTask(agent.id, activePhase.phase_number)
-        if (!task) continue
-
-        // Diminishing returns check — skip if agent is producing repetitive work
+        // Full anomaly detection
         try {
-          if (isDiminishingReturns(agent.id, task.type, activePhase.phase_number)) {
-            console.log(`[INTELLIGENCE] Diminishing returns for ${agent.personality_name} on ${task.type} — skipping`)
-            db.run(`UPDATE actions SET status = 'queued', started_at = NULL WHERE id = ?`, [task.id])
-            setAgentStatus(agent.id, 'idle')
-            continue
-          }
-        } catch { /* non-critical — proceed with task */ }
+          const anomalies = detectAnomalies()
+          for (const anomaly of anomalies) { applyAnomalyPenalty(anomaly) }
+          if (anomalies.length > 0) console.log(`[ORCHESTRATOR] Anomaly detection: ${anomalies.length} anomalies found`)
+        } catch (e) { console.error('[ORCHESTRATOR] Anomaly detection error:', e) }
 
-        // Set agent to working
-        setAgentStatus(agent.id, 'working')
+        // Phase advancement
+        try { checkPhaseAdvancement(activePhase.phase_number) } catch (e) { console.error('[PHASE] Error:', e) }
 
-        // Broadcast AG-UI event
-        broadcastAGUI({
-          type: 'RUN_STARTED',
-          agentId: agent.id,
-          agentName: agent.personality_name,
-          taskId: task.id,
-          taskDescription: task.description,
-          phase: activePhase.phase_number,
-        })
-
-        // Spawn agent process (async — doesn't block the loop)
-        spawnAgentProcess(agent, task)
-          .catch(err => {
-            console.error(`[ORCHESTRATOR] Failed to spawn ${agent.personality_name}:`, err)
-            setAgentStatus(agent.id, 'idle')
-          })
+        // Cycle summary
+        const working = db.query(`SELECT COUNT(*) as n FROM agents WHERE status = 'working'`).get() as { n: number }
+        const queued = db.query(`SELECT COUNT(*) as n FROM actions WHERE status = 'queued' AND phase = ?`).get(activePhase.phase_number) as { n: number }
+        console.log(`[ORCHESTRATOR] Cycle ${cycleCount} | Phase ${activePhase.phase_number} (${activePhase.name}) | Active: ${working.n}/${CONCURRENCY_LIMITS.total} | Queued: ${queued.n} | Sim Day: ${getSimDay()}`)
       }
 
-      // ---- Reward system updates (every cycle) ----
-      // Recalculate CFS for all agents (with decay)
-      recalculateAllCFS()
-
-      // Update capability tiers based on new CFS values
-      updateAllTiers()
-
-      // Check phase quorum status
-      checkQuorumStatus(activePhase.phase_number)
-
-      // Reports generation (every 50 cycles) + opportunity backfill
+      // EVERY 50 CYCLES (~8 min): reports
       if (cycleCount % 50 === 0) {
-        try {
-          checkReportGeneration(cycleCount)
-          backfillOpportunities()
-        } catch (e) {
-          console.error('[REPORTS] Error:', e)
-        }
+        try { checkReportGeneration(cycleCount); backfillOpportunities() } catch (e) { console.error('[REPORTS] Error:', e) }
       }
 
-      // Log rotation check every 100 cycles
+      // EVERY 60 CYCLES (~10 min): collaboration + deadlock
+      if (cycleCount % 60 === 0) {
+        checkDeadlock()
+        try { runCollaborationChecks(activePhase.phase_number) } catch (e) { console.error('[COLLAB] Error:', e) }
+      }
+
+      // EVERY 100 CYCLES (~17 min): performance + log rotation
       if (cycleCount % 100 === 0) {
+        try {
+          const sprint = getCurrentSprint()
+          if (sprint) checkPerformanceActions(activePhase.phase_number)
+        } catch (e) { console.error('[PERFORMANCE] Error:', e) }
         try { rotateLogs() } catch { /* non-critical */ }
       }
 
-      // Log cycle summary periodically
-      if (cycleCount % 30 === 0) {
-        const working = db.query(`SELECT COUNT(*) as n FROM agents WHERE status = 'working'`).get() as { n: number }
-        const queued = db.query(`SELECT COUNT(*) as n FROM actions WHERE status = 'queued' AND phase = ?`).get(activePhase.phase_number) as { n: number }
-        console.log(
-          `[ORCHESTRATOR] Cycle ${cycleCount} | Phase ${activePhase.phase_number} (${activePhase.name}) | ` +
-          `Active: ${working.n}/${CONCURRENCY_LIMITS.total} | Queued: ${queued.n} | Sim Day: ${getSimDay()}`
-        )
+      // EVERY 200 CYCLES (~33 min): artifact curation
+      if (cycleCount % 200 === 0 && activePhase.phase_number >= 2) {
+        try { checkArtifactCuration(activePhase.phase_number) } catch (e) { console.error('[CURATOR] Error:', e) }
       }
+
+      // -----------------------------------------------------------------------
+      // EVERY CYCLE: blocker cleanup + agent dispatch
+      // -----------------------------------------------------------------------
+
+      // Auto-resolve stale/phantom blockers
+      try {
+        const activeBlockers = getActiveBlockers()
+        for (const blocker of activeBlockers) {
+          if (blocker.durationMinutes > 120) {
+            resolveBlockerAuto(blocker.id, blocker.agentId, 'Auto-resolved: stale blocker (>2 hours)')
+            console.log(`[ORCHESTRATOR] Auto-resolved stale blocker for ${blocker.agentName} (${blocker.durationMinutes}min old)`)
+            continue
+          }
+          const hasCompletions = db.query(`SELECT 1 FROM actions WHERE agent_id = ? AND phase = ? AND status = 'completed' LIMIT 1`).get(blocker.agentId, activePhase.phase_number)
+          if (hasCompletions) {
+            resolveBlockerAuto(blocker.id, blocker.agentId, 'Auto-resolved: agent has completed work this phase')
+            console.log(`[ORCHESTRATOR] Auto-resolved phantom blocker for ${blocker.agentName}`)
+            continue
+          }
+        }
+      } catch (e) { console.error('[ORCHESTRATOR] Blocker cleanup error:', e) }
+
+      // Dispatch tasks to ready agents
+      const readyAgents = getReadyAgents()
+      for (const agent of readyAgents) {
+        if (!getAvailableSlot(agent.team)) continue
+        const task = dequeueTask(agent.id, activePhase.phase_number)
+        if (!task) continue
+
+        // Diminishing returns check
+        try {
+          if (isDiminishingReturns(agent.id, task.type, activePhase.phase_number)) {
+            console.log(`[INTELLIGENCE] Diminishing returns for ${agent.personality_name} on ${task.type} -- deferring`)
+            db.run(`UPDATE actions SET status = 'deferred', started_at = NULL WHERE id = ?`, [task.id])
+            setAgentStatus(agent.id, 'idle')
+            continue
+          }
+        } catch { /* non-critical -- proceed with task */ }
+
+        setAgentStatus(agent.id, 'working')
+        broadcastAGUI({ type: 'RUN_STARTED', agentId: agent.id, agentName: agent.personality_name, taskId: task.id, taskDescription: task.description, phase: activePhase.phase_number })
+        spawnAgentProcess(agent, task).catch(err => { console.error(`[ORCHESTRATOR] Failed to spawn ${agent.personality_name}:`, err); setAgentStatus(agent.id, 'idle') })
+      }
+
+      // Phase quorum check (every cycle -- lightweight query)
+      checkQuorumStatus(activePhase.phase_number)
+
     } catch (err) {
       // Orchestrator never crashes on errors — log and continue
       console.error(`[ORCHESTRATOR] Cycle ${cycleCount} error:`, err)

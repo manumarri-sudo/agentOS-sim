@@ -84,3 +84,12 @@ export function advanceSimDayIfNeeded(): void {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Retro check -- returns true if current sim_day is a retro day (every 7 days)
+// ---------------------------------------------------------------------------
+const RETRO_INTERVAL = 7
+
+export function isRetroDay(simDay: number): boolean {
+  return simDay > 0 && simDay % RETRO_INTERVAL === 0
+}

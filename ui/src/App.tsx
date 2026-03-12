@@ -1,13 +1,13 @@
 import { useState } from 'react'
 import { useAPI, useSSE } from './hooks/useAPI'
 import { getToken, setToken } from './lib/api'
-import { fmtRelative, fmtTime, fmtDuration } from './lib/utils'
+// utils imported by child components as needed
 import { Header } from './components/Header'
 import { TeamGrid } from './dashboard/TeamGrid'
 import { TaskList } from './dashboard/TaskList'
-import { ActivityFeed } from './dashboard/ActivityFeed'
-import { MessageBus } from './dashboard/MessageBus'
-import { BudgetTracker } from './dashboard/BudgetTracker'
+// ActivityFeed and MessageBus available as separate tab views if needed
+import { UnitEconomicsPanel } from './dashboard/UnitEconomicsPanel'
+import { BlockersPanel } from './dashboard/BlockersPanel'
 import { RewardPanel } from './dashboard/RewardPanel'
 import { DebateViewer } from './dashboard/DebateViewer'
 import { PhaseGate } from './experiment/PhaseGate'
@@ -19,8 +19,10 @@ import { DirectiveBox } from './components/DirectiveBox'
 import { ReportViewer } from './reports/ReportViewer'
 import { AgentTaskTracker } from './dashboard/AgentTaskTracker'
 import { CEOChat } from './dashboard/CEOChat'
+import { GovernancePanel } from './dashboard/GovernancePanel'
+import { HumanTasksPanel } from './dashboard/HumanTasksPanel'
 
-type Tab = 'overview' | 'tasks' | 'agents' | 'experiment' | 'reports'
+type Tab = 'overview' | 'tasks' | 'agents' | 'experiment' | 'reports' | 'governance'
 
 function LoginGate({ onLogin }: { onLogin: (token: string) => void }) {
   const [value, setValue] = useState('')
@@ -45,6 +47,71 @@ function LoginGate({ onLogin }: { onLogin: (token: string) => void }) {
           ENTER
         </button>
       </div>
+    </div>
+  )
+}
+
+function MessagePanel({ messages }: { messages: any[] }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [showAll, setShowAll] = useState(false)
+
+  const msgs = showAll ? messages.slice(0, 200) : messages.slice(0, 30)
+
+  return (
+    <div className="border-b border-border p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] text-muted tracking-[0.1em]">
+          MESSAGES <span className="text-text ml-1">{messages.length}</span>
+        </div>
+        {messages.length > 30 && (
+          <button
+            onClick={() => setShowAll(!showAll)}
+            className="text-[9px] text-accent hover:text-text"
+          >
+            {showAll ? 'Show less' : `Show all ${messages.length}`}
+          </button>
+        )}
+      </div>
+      {msgs.length === 0 ? (
+        <div className="text-muted text-[10px]">No messages yet.</div>
+      ) : (
+        <div className="space-y-0.5">
+          {msgs.map((m: any, i: number) => {
+            const isUrgent = m.priority === 'urgent' || m.priority === 'high'
+            const isExpanded = expandedId === (m.id ?? i)
+            return (
+              <div
+                key={m.id ?? i}
+                className={`px-2 py-1.5 text-[10px] rounded-sm cursor-pointer transition-colors
+                  ${isUrgent ? 'bg-accent/8 border-l-2 border-l-accent' : 'border-l-2 border-l-transparent'}
+                  ${isExpanded ? 'bg-border/30' : 'hover:bg-border/15'}`}
+                onClick={() => setExpandedId(isExpanded ? null : (m.id ?? i))}
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="text-text/90 font-medium">{m.from_name ?? m.from_agent_name ?? m.from_agent_id}</span>
+                  <span className="text-muted text-[8px]">{'\u2192'}</span>
+                  <span className="text-muted text-[9px]">{m.to_name ?? m.to_agent_id ?? m.to_team}</span>
+                  <span className={`ml-auto text-[8px] ${
+                    m.priority === 'urgent' ? 'text-error' :
+                    m.priority === 'high' ? 'text-accent' :
+                    'text-muted'
+                  }`}>
+                    {m.priority === 'urgent' ? '!!' : m.priority === 'high' ? '!' : ''}
+                  </span>
+                </div>
+                {m.subject && (
+                  <div className="text-text/50 mt-0.5 break-words">{m.subject}</div>
+                )}
+                {isExpanded && m.body && (
+                  <div className="text-text/70 mt-1 text-[9px] leading-relaxed break-words whitespace-pre-wrap border-t border-border/50 pt-1 max-h-40 overflow-auto">
+                    {m.body}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }
@@ -92,6 +159,7 @@ export function App() {
     { id: 'agents', label: 'Agents' },
     { id: 'experiment', label: 'Experiment' },
     { id: 'reports', label: 'Reports' },
+    { id: 'governance', label: 'Governance' },
   ]
 
   return (
@@ -182,8 +250,8 @@ export function App() {
                               {task?.type ?? proc?.taskType ?? ''}
                             </span>
                           </div>
-                          <div className="text-[11px] text-accent/80 leading-relaxed">
-                            {(task?.description ?? proc?.taskDescription ?? 'Working...').split('\n')[0].slice(0, 120)}
+                          <div className="text-[11px] text-accent/80 leading-relaxed break-words whitespace-pre-wrap">
+                            {(task?.description ?? proc?.taskDescription ?? 'Working...').split('\n')[0]}
                           </div>
                         </div>
                       ))
@@ -219,17 +287,13 @@ export function App() {
                         {name}
                         <span className="text-muted font-normal ml-1">({tasks.length})</span>
                       </div>
-                      {tasks.map((t: any) => {
-                        // Extract just the first sentence/line of description
-                        const shortDesc = t.description.split('\n')[0].slice(0, 100)
-                        return (
-                          <div key={t.id} className="text-[10px] text-text/60 pl-4 mb-0.5 leading-relaxed">
+                      {tasks.map((t: any) => (
+                          <div key={t.id} className="text-[10px] text-text/60 pl-4 mb-0.5 leading-relaxed break-words">
                             <span className="text-muted mr-1">{'\u2022'}</span>
                             <span className="text-[9px] text-muted uppercase mr-1">{t.type}</span>
-                            {shortDesc}{shortDesc.length >= 100 ? '...' : ''}
+                            {t.description.split('\n')[0]}
                           </div>
-                        )
-                      })}
+                      ))}
                     </div>
                   ))
                 })()}
@@ -263,6 +327,8 @@ export function App() {
                                      ev.event_type === 'review_assigned' ? '#c678dd' :
                                      ev.event_type === 'meeting_scheduled' ? '#e5c07b' :
                                      ev.event_type === 'human_directive' ? '#61afef' :
+                                     ev.event_type === 'phase_advanced' ? '#98c379' :
+                                     ev.event_type === 'post_mortem' ? '#e5c07b' :
                                      '#c5c8c6'
                             }}>
                               {ev.event_type === 'task_completed' ? '\u2713' :
@@ -271,6 +337,8 @@ export function App() {
                                ev.event_type === 'review_assigned' ? '\u2605' :
                                ev.event_type === 'meeting_scheduled' ? '\u2606' :
                                ev.event_type === 'human_directive' ? '\u25B6' :
+                               ev.event_type === 'phase_advanced' ? '\u2605' :
+                               ev.event_type === 'post_mortem' ? '\u26A0' :
                                '\u2022'}
                             </span>
                             <span className="text-text/80">{ev.summary}</span>
@@ -295,7 +363,7 @@ export function App() {
                       <span className="text-text">{t.agent_name}</span>
                       <span className="text-muted ml-1">—</span>
                       <span className="text-[9px] text-muted uppercase ml-1 mr-1">{t.type}</span>
-                      <span className="text-muted">{t.description.split('\n')[0].slice(0, 80)}{t.description.length > 80 ? '...' : ''}</span>
+                      <span className="text-muted break-words">{t.description.split('\n')[0]}</span>
                     </div>
                   ))
                 })()}
@@ -304,73 +372,11 @@ export function App() {
 
             {/* Right sidebar */}
             <div className="border-l border-border flex flex-col min-h-0 overflow-auto">
+              <HumanTasksPanel />
+              <BlockersPanel />
               <DirectiveBox />
-              <BudgetTracker budget={budget} />
-              <div className="border-b border-border p-3">
-                <div className="text-[10px] text-muted tracking-[0.1em] mb-2">MESSAGES</div>
-                {(() => {
-                  const msgs = messages ?? []
-                  if (msgs.length === 0) return <div className="text-muted text-[10px]">No messages yet.</div>
-
-                  // Deduplicate: collapse repeated "completed" notifications into counts
-                  // Group by from+subject pattern, keep unique subjects
-                  const seen = new Set<string>()
-                  const deduped: any[] = []
-                  const completionCounts: Record<string, number> = {}
-
-                  for (const m of msgs) {
-                    const subj = m.subject ?? ''
-                    // Collapse "X completed: ..." notifications
-                    if (subj.includes('completed:')) {
-                      const from = m.from_agent_name ?? m.from_agent_id
-                      completionCounts[from] = (completionCounts[from] ?? 0) + 1
-                      continue
-                    }
-                    // Collapse duplicate subjects
-                    const key = `${m.from_agent_id}-${subj.slice(0, 40)}`
-                    if (seen.has(key)) continue
-                    seen.add(key)
-                    deduped.push(m)
-                  }
-
-                  // Add collapsed completion summaries
-                  const completionSummaries = Object.entries(completionCounts).map(([name, count]) => ({
-                    _synthetic: true,
-                    from_name: name,
-                    subject: `${count} task completion${count > 1 ? 's' : ''} reported`,
-                    priority: 'normal',
-                  }))
-
-                  const display = [...completionSummaries, ...deduped].slice(0, 30)
-
-                  return (
-                    <div className="space-y-1">
-                      {display.map((m: any, i: number) => {
-                        const isUrgent = m.priority === 'urgent' || m.priority === 'high'
-                        return (
-                          <div key={i} className={`px-2 py-1.5 text-[10px] rounded-sm ${
-                            isUrgent ? 'bg-accent/8 border-l-2 border-l-accent' : 'border-l-2 border-l-transparent'
-                          }`}>
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-text/90 font-medium">{m.from_name ?? m.from_agent_name ?? m.from_agent_id}</span>
-                              {!m._synthetic && (
-                                <>
-                                  <span className="text-muted text-[8px]">{'\u2192'}</span>
-                                  <span className="text-muted text-[9px]">{m.to_agent_name ?? m.to_agent_id ?? m.to_team}</span>
-                                </>
-                              )}
-                              {isUrgent && <span className="ml-auto text-[8px] text-accent">!</span>}
-                            </div>
-                            {m.subject && (
-                              <div className="text-text/50 mt-0.5 truncate">{m.subject}</div>
-                            )}
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )
-                })()}
-              </div>
+              <UnitEconomicsPanel />
+              <MessagePanel messages={messages ?? []} />
               <RewardPanel
                 cfs={cfs ?? []}
                 attribution={attribution ?? []}
@@ -429,6 +435,13 @@ export function App() {
         {tab === 'reports' && (
           <div className="h-full overflow-auto">
             <ReportViewer />
+          </div>
+        )}
+
+        {/* GOVERNANCE */}
+        {tab === 'governance' && (
+          <div className="h-full overflow-hidden">
+            <GovernancePanel />
           </div>
         )}
       </div>

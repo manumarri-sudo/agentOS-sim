@@ -15,7 +15,7 @@ import {
   CONCURRENCY_LIMITS,
 } from './orchestrator'
 import { getActiveProcesses, killAgentProcess } from './agents/runner'
-import { getRemainingBudget, getPhaseSpendSummary, recordSpend } from './budget/enforcer'
+import { getRemainingBudget, getPhaseSpendSummary, recordSpend, getApiCostTotal } from './budget/enforcer'
 import { getSimDay, advanceSimDay } from './clock'
 import { getActivityLog, logActivity } from './activity'
 import { sendMessage } from './messages/bus'
@@ -43,6 +43,7 @@ import {
 } from './reward'
 import { authMiddleware } from './middleware/auth'
 import { getGovernanceEvents } from './governance/observer'
+import { getRecentAnomalies } from './governance/anomalies'
 import { getPerAgentCosts, getPerTeamCosts, getPerPhaseCosts, getTokenCostTotals, MODEL_PRICING } from './usage/token-costs'
 import { PUBLIC_DASHBOARD_HTML } from './public-dashboard'
 
@@ -67,6 +68,7 @@ app.get('/api/health', (c) => {
   const activePhase = db.query(`SELECT phase_number, name FROM experiment_phases WHERE status = 'active'`).get() as { phase_number: number; name: string } | null
   const activeAgents = db.query(`SELECT COUNT(*) as count FROM agents WHERE status = 'working'`).get() as { count: number }
 
+  const { getProviderConfig } = require('./providers/llm')
   return c.json({
     status: 'ok',
     db: 'connected',
@@ -79,7 +81,64 @@ app.get('/api/health', (c) => {
     orchestratorRunning: isOrchestratorRunning(),
     orchestratorCycles: getOrchestratorCycleCount(),
     remainingBudget: getRemainingBudget(),
+    llmProvider: getProviderConfig(),
   })
+})
+
+// ---------------------------------------------------------------------------
+// LLM Provider Management — per-agent Claude/OpenAI assignment
+// ---------------------------------------------------------------------------
+app.get('/api/provider', (c) => {
+  const { getProviderConfig } = require('./providers/llm')
+  return c.json(getProviderConfig())
+})
+
+app.post('/api/provider', async (c) => {
+  const { setGlobalProvider } = require('./providers/llm')
+  const body = await c.req.json()
+  if (!['claude', 'openai', 'codex'].includes(body.provider)) {
+    return c.json({ error: 'provider must be "claude", "openai", or "codex"' }, 400)
+  }
+  setGlobalProvider(body.provider)
+  return c.json({ status: 'ok', globalDefault: body.provider })
+})
+
+app.post('/api/provider/:agentId', async (c) => {
+  const { setAgentProvider } = require('./providers/llm')
+  const agentId = c.req.param('agentId')
+  const body = await c.req.json()
+  if (body.provider === null || body.provider === 'default') {
+    setAgentProvider(agentId, null)
+    return c.json({ status: 'ok', agentId, provider: 'default (global)' })
+  }
+  if (!['claude', 'openai', 'codex'].includes(body.provider)) {
+    return c.json({ error: 'provider must be "claude", "openai", "codex", or null' }, 400)
+  }
+  setAgentProvider(agentId, body.provider)
+  return c.json({ status: 'ok', agentId, provider: body.provider })
+})
+
+app.post('/api/provider/bulk', async (c) => {
+  const { setAgentProvider } = require('./providers/llm')
+  const body = await c.req.json()
+  if (!Array.isArray(body.agents) || !['claude', 'openai', 'codex'].includes(body.provider)) {
+    return c.json({ error: 'need { agents: string[], provider: "claude"|"openai"|"codex" }' }, 400)
+  }
+  for (const agentId of body.agents) {
+    setAgentProvider(agentId, body.provider)
+  }
+  return c.json({ status: 'ok', count: body.agents.length, provider: body.provider })
+})
+
+app.post('/api/provider/team/:team', async (c) => {
+  const { setTeamProvider } = require('./providers/llm')
+  const team = c.req.param('team')
+  const body = await c.req.json()
+  if (!['claude', 'openai', 'codex'].includes(body.provider)) {
+    return c.json({ error: 'provider must be "claude", "openai", or "codex"' }, 400)
+  }
+  setTeamProvider(team, body.provider)
+  return c.json({ status: 'ok', team, provider: body.provider })
 })
 
 // Notion connectivity status
@@ -213,14 +272,15 @@ app.post('/api/directive', async (c) => {
   const db = getDb()
   const phase = (db.query(`SELECT phase_number FROM experiment_phases WHERE status = 'active'`).get() as any)?.phase_number ?? 1
 
-  // Always send as a message
-  sendMessage({
-    fromAgentId: 'human',
-    toAgentId: targetAgentId,
-    subject: `Directive from human supervisor`,
-    body: message,
-    priority: 'urgent',
-  })
+  // Send as a message from Priya (CoS) since 'human' isn't in agents table
+  try {
+    db.run(`
+      INSERT INTO messages (id, from_agent_id, to_agent_id, subject, body, priority, status)
+      VALUES (?, 'priya', ?, 'Directive from human supervisor', ?, 'urgent', 'sent')
+    `, [crypto.randomUUID(), targetAgentId, `[HUMAN DIRECTIVE] ${message}`])
+  } catch (e) {
+    console.error('[DIRECTIVE] Failed to send message:', e)
+  }
 
   logActivity({
     agentId: targetAgentId,
@@ -286,11 +346,15 @@ app.get('/api/budget', (c) => {
 
   const budget = Number(process.env.TOTAL_EXPERIMENT_BUDGET_USD ?? 200)
 
+  // API cost is informational only (sunk cost from Claude Max subscription)
+  const apiCost = getApiCostTotal()
+
   return c.json({
     totalBudget: budget,
     totalSpent: spent.total_spent,
     totalRevenue: revenue.total_revenue,
     remaining: budget - spent.total_spent,
+    apiCost,              // sunk cost -- shown but NOT deducted from $200
     phaseBreakdown: getPhaseSpendSummary(),
   })
 })
@@ -766,6 +830,89 @@ app.get('/api/governance/events', (c) => {
   return c.json(getGovernanceEvents({ eventType: eventType as any, agentId, limit }))
 })
 
+// ---- Governance Anomalies (Dual Mandate immune system) ----
+app.get('/api/governance/anomalies', (c) => {
+  const limit = Number(c.req.query('limit') ?? 50)
+  return c.json(getRecentAnomalies(limit))
+})
+
+// ---- Endurance Overhaul APIs ----
+app.get('/api/briefs/latest', (c) => {
+  const { getLatestBrief } = require('./briefs/daily-brief')
+  const brief = getLatestBrief()
+  return c.json(brief ?? { sim_day: 0, content: 'No brief generated yet' })
+})
+
+app.get('/api/citations/stats', (c) => {
+  const phase = c.req.query('phase') ? Number(c.req.query('phase')) : undefined
+  const { getCitationStats } = require('./reward/citation-limiter')
+  return c.json(getCitationStats(phase))
+})
+
+app.get('/api/feasibility/status', (c) => {
+  const fromPhase = Number(c.req.query('from') ?? 2)
+  const toPhase = Number(c.req.query('to') ?? 3)
+  const { checkFeasibilityGate } = require('./governance/feasibility')
+  return c.json(checkFeasibilityGate(fromPhase, toPhase))
+})
+
+app.get('/api/budget/daily', (c) => {
+  const db = getDb()
+  const rows = db.query(`
+    SELECT sim_day, total_spent, daily_cap, cap_overridden
+    FROM daily_spend_tracking ORDER BY sim_day DESC LIMIT 30
+  `).all()
+  return c.json(rows)
+})
+
+// ---- Funnel Events (conversion tracking) ----
+app.post('/api/funnel/event', async (c) => {
+  const body = await c.req.json()
+  const db = getDb()
+  const id = crypto.randomUUID()
+  const simDay = db.query(`SELECT sim_day FROM sim_clock WHERE id = 1`).get() as { sim_day: number } | null
+  db.run(`
+    INSERT INTO funnel_events (id, event_type, source_channel, marketing_queue_id, revenue_amount, agent_id, metadata, sim_day, phase)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    id, body.eventType, body.sourceChannel ?? null, body.marketingQueueId ?? null,
+    body.revenueAmount ?? 0, body.agentId ?? null, JSON.stringify(body.metadata ?? {}),
+    simDay?.sim_day ?? 0, body.phase ?? 0,
+  ])
+  return c.json({ id })
+})
+
+app.get('/api/funnel/summary', (c) => {
+  const db = getDb()
+  const summary = db.query(`
+    SELECT event_type, source_channel, COUNT(*) as count,
+           COALESCE(SUM(revenue_amount), 0) as total_revenue
+    FROM funnel_events
+    GROUP BY event_type, source_channel
+  `).all()
+  return c.json(summary)
+})
+
+// ---- ROI Enforcement Status (removed -- ghost system) ----
+app.get('/api/roi/status', (c) => {
+  return c.json([])
+})
+
+// ---- Marketing Channel Metrics ----
+app.get('/api/marketing/channels', (c) => {
+  const db = getDb()
+  const channels = db.query(`
+    SELECT channel,
+           COALESCE(SUM(spend_usd), 0) as total_spend,
+           COALESCE(SUM(clicks), 0) as total_clicks,
+           COALESCE(SUM(conversions), 0) as total_conversions,
+           COALESCE(SUM(revenue_usd), 0) as total_revenue
+    FROM marketing_channel_metrics
+    GROUP BY channel
+  `).all()
+  return c.json(channels)
+})
+
 // ---- Activity Log (agent interactions timeline) ----
 app.get('/api/activity', (c) => {
   const limit = Number(c.req.query('limit') ?? 50)
@@ -779,6 +926,14 @@ app.get('/api/reports', (c) => {
     SELECT * FROM experiment_reports ORDER BY created_at DESC LIMIT 50
   `).all()
   return c.json(reports)
+})
+
+// ---- Daily Summary (manual trigger) ----
+app.post('/api/reports/daily-summary', async (c) => {
+  const { generateDailySummary, pushSummaryToNotion } = await import('./reports/daily-summary')
+  generateDailySummary()
+  await pushSummaryToNotion()
+  return c.json({ ok: true, path: 'logs/daily-summaries.csv' })
 })
 
 // ---- Usage Budget Summary (doc 8 Part 6) ----
@@ -874,14 +1029,16 @@ app.post('/api/ceo-chat', async (c) => {
     VALUES (?, 'human', ?, ?, ?, ?, 0)
   `, [id, message, messageType ?? 'chat', phase, simDay])
 
-  // Also send as a message to Reza so he sees it in his context
-  sendMessage({
-    fromAgentId: 'human',
-    toAgentId: 'reza',
-    subject: 'Message from human operator',
-    body: message,
-    priority: 'urgent',
-  })
+  // Also inject as a message to Reza so he sees it in his context
+  // Use raw INSERT because 'human' is not in agents table (FK constraint)
+  try {
+    db.run(`
+      INSERT INTO messages (id, from_agent_id, to_agent_id, subject, body, priority, status)
+      VALUES (?, 'priya', 'reza', 'Message from human operator', ?, 'urgent', 'sent')
+    `, [crypto.randomUUID(), `[FROM HUMAN] ${message}`])
+  } catch (e) {
+    console.error('[CEO-CHAT] Failed to inject message to Reza:', e)
+  }
 
   logActivity({
     agentId: 'reza',
@@ -955,6 +1112,8 @@ app.get('/public/api/snapshot', (c) => {
   const governanceRows = getGovernanceEvents({ limit: 30 })
   const blockerRows = getActiveBlockers()
   const tokenCosts = getTokenCostTotals()
+  const anomalyRows = getRecentAnomalies(20)
+  const roiLog: any[] = []
 
   const decisions = db.query(`
     SELECT title, body, status, made_by_agent, created_at FROM decisions ORDER BY created_at DESC LIMIT 10
@@ -979,6 +1138,8 @@ app.get('/public/api/snapshot', (c) => {
     governance: governanceRows,
     blockers: blockerRows,
     tokenCosts,
+    anomalies: anomalyRows,
+    roiEnforcement: roiLog,
     decisions,
     sprint: sprintInfo,
     orchestrator: { running: isOrchestratorRunning(), cycles: getOrchestratorCycleCount() },
@@ -1040,6 +1201,10 @@ console.log(`   Stream:    http://localhost:${port}/stream\n`)
   if (orphaned.changes > 0) {
     console.log(`[SERVER] Reset ${orphaned.changes} orphaned running tasks to queued`)
   }
+
+  // Ensure LLM provider column exists in agents table
+  const { ensureProviderColumn } = require('./providers/llm')
+  ensureProviderColumn()
 
   // Auto-resume orchestrator if a phase is active
   const activePhase = db.query(`SELECT 1 FROM experiment_phases WHERE status = 'active'`).get()

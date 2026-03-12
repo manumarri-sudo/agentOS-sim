@@ -190,26 +190,62 @@ export function checkForDebates(phase: number): void {
     const key = `debate-${debate.agent1}-${debate.agent2}-p${phase}`
     if (hasInteractionKey(key)) continue
 
+    // Bounded disagreement: if this pair already had a resolved debate, escalate to CEO
+    const priorDebate = db.query(`
+      SELECT id, resolution FROM agent_debates
+      WHERE ((initiator_id = ? AND responder_id = ?) OR (initiator_id = ? AND responder_id = ?))
+        AND resolved_at IS NOT NULL
+      ORDER BY resolved_at DESC LIMIT 1
+    `).get(debate.agent1Id, debate.agent2Id, debate.agent2Id, debate.agent1Id) as { id: string; resolution: string } | null
+
+    if (priorDebate) {
+      // Escalate to CEO -- same pair already debated and it resurfaced
+      enqueueTask({
+        agentId: 'reza',
+        type: 'decide',
+        description: `ESCALATED DISAGREEMENT: ${debate.agent1Name} vs ${debate.agent2Name}\n\n` +
+          `These agents have conflicting views on: ${debate.topic}\n` +
+          `A prior debate was resolved by Priya with ruling: "${priorDebate.resolution?.slice(0, 500)}"\n` +
+          `But the conflict has resurfaced. As CEO, make a FINAL decision.\n\n` +
+          `${debate.agent1Name}'s position:\n${debate.preview1?.slice(0, 800)}\n\n` +
+          `${debate.agent2Name}'s position:\n${debate.preview2?.slice(0, 800)}\n\n` +
+          `Use [DECISION title:RESOLVE ${debate.topic}] to record your final ruling.\n` +
+          `Use [MSG] to notify both agents. This ruling is binding.`,
+        phase,
+      })
+      addInteractionKey(key)
+      console.log(`[COLLAB] Escalated debate to CEO: ${debate.agent1Name} vs ${debate.agent2Name} (prior ruling existed)`)
+      continue
+    }
+
+    // Record debate in agent_debates table
+    const debateId = crypto.randomUUID()
+    db.run(`
+      INSERT INTO agent_debates (id, topic, initiator_id, responder_id, initiator_position, responder_position, phase)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [debateId, debate.topic, debate.agent1Id, debate.agent2Id, debate.preview1?.slice(0, 1000) ?? '', debate.preview2?.slice(0, 1000) ?? '', phase])
+
     // Create a facilitated debate task for Priya (CoS)
     enqueueTask({
       agentId: 'priya',
       type: 'meeting',
-      description: `FACILITATED DISCUSSION: ${debate.agent1Name} vs ${debate.agent2Name}\n\n` +
+      description: `FACILITATED DISCUSSION: ${debate.agent1Name} vs ${debate.agent2Name} [debate:${debateId}]\n\n` +
         `These two agents have produced work that may contain conflicting views on: ${debate.topic}\n\n` +
         `${debate.agent1Name}'s position:\n${debate.preview1}\n\n` +
         `${debate.agent2Name}'s position:\n${debate.preview2}\n\n` +
         `As Chief of Staff, facilitate this disagreement:\n` +
-        `1. STATE THE CONFLICT clearly — what exactly do they disagree about?\n` +
-        `2. STEELMAN both sides — what's the strongest version of each argument?\n` +
-        `3. YOUR ASSESSMENT — who do you think is more right and why?\n` +
-        `4. RECOMMENDATION — what should we do? Side with one? Compromise? Test both?\n` +
-        `5. MESSAGES — use [MSG to:${debate.agent1Id} priority:high] and [MSG to:${debate.agent2Id} priority:high] to tell each agent your ruling and what they should do next.\n\n` +
-        `Don't be diplomatic. Be clear about who has the stronger argument.`,
+        `1. STATE THE CONFLICT clearly -- what exactly do they disagree about?\n` +
+        `2. STEELMAN both sides -- what's the strongest version of each argument?\n` +
+        `3. YOUR ASSESSMENT -- who do you think is more right and why?\n` +
+        `4. RECOMMENDATION -- what should we do? Side with one? Compromise? Test both?\n` +
+        `5. Record your ruling with [DECISION title:RESOLVE ${debate.topic}] <your ruling>\n` +
+        `6. MESSAGES -- use [MSG to:${debate.agent1Id} priority:high] and [MSG to:${debate.agent2Id} priority:high] to tell each agent your ruling.\n\n` +
+        `Don't be diplomatic. Be clear about who has the stronger argument. Your ruling is binding.`,
       phase,
     })
 
     addInteractionKey(key)
-    console.log(`[COLLAB] Debate scheduled: ${debate.agent1Name} vs ${debate.agent2Name} on "${debate.topic}"`)
+    console.log(`[COLLAB] Debate scheduled: ${debate.agent1Name} vs ${debate.agent2Name} on "${debate.topic}" [${debateId}]`)
   }
 }
 

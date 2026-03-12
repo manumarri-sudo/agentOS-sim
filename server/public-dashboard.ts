@@ -279,13 +279,26 @@ async function poll() {
       : blockers.map(b => '<div class="blocker-row">\\u26A0 ' + esc(b.agent_id || '') + ': ' + esc(b.reason || '') + '</div>').join('');
 
     // Governance
+    const govLabels = {
+      verification_failure: 'Verification Failed',
+      quality_escalation: 'Quality Escalation',
+      permission_decay: 'Permission Issue',
+      reward_manipulation_attempt: 'Reward Manipulation',
+      unauthorized_access: 'Unauth Access',
+      forbidden_file_touch: 'Protected File',
+      budget_boundary_probe: 'Budget Probe',
+      trust_ladder_advancement: 'Trust Upgrade',
+      deadline_beat: 'Deadline Beat',
+    };
     const gov = d.governance || [];
     $('gov-list').innerHTML = gov.length === 0
       ? '<div class="empty">No governance events.</div>'
-      : gov.slice(0, 12).map(g => {
+      : gov.slice(0, 15).map(g => {
         const col = g.severity === 'critical' ? 'var(--danger)' : g.severity === 'warning' ? 'var(--warn)' : 'var(--muted)';
-        return '<div class="gov-row"><div class="gov-type" style="color:' + col + '">' + esc(g.event_type || '') +
-          '</div><div class="gov-detail">' + esc((g.details || '').slice(0, 120)) + '</div></div>';
+        const label = govLabels[g.event_type] || g.event_type;
+        return '<div class="gov-row"><div class="gov-type" style="color:' + col + '">' + esc(label) +
+          (g.agent_name ? ' <span style="color:var(--text);font-size:9px">(' + esc(g.agent_name) + ')</span>' : '') +
+          '</div><div class="gov-detail">' + esc((g.details || '').slice(0, 140)) + '</div></div>';
       }).join('');
 
   } catch (e) {

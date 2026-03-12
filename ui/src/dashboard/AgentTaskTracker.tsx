@@ -7,6 +7,10 @@ const STATUS_COLORS: Record<string, { bg: string; border: string; text: string; 
   queued:    { bg: 'transparent', border: '#3e4451', text: '#5c6370', label: 'QUEUED' },
   proposed_complete: { bg: 'rgba(229,192,123,0.10)', border: '#e5c07b', text: '#e5c07b', label: 'VERIFYING' },
   failed:    { bg: 'rgba(224,108,117,0.10)', border: '#e06c75', text: '#e06c75', label: 'FAILED' },
+  verification_failed: { bg: 'rgba(224,108,117,0.08)', border: '#e06c75', text: '#e06c75', label: 'V-FAIL' },
+  cancelled: { bg: 'transparent', border: '#3e4451', text: '#5c6370', label: 'CANCELLED' },
+  deferred:  { bg: 'transparent', border: '#5c6370', text: '#5c6370', label: 'DEFERRED' },
+  escalated: { bg: 'rgba(198,120,221,0.10)', border: '#c678dd', text: '#c678dd', label: 'ESCALATED' },
   review:    { bg: 'rgba(198,120,221,0.10)', border: '#c678dd', text: '#c678dd', label: 'REVIEW' },
 }
 

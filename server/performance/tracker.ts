@@ -78,10 +78,34 @@ export function generatePerformanceScorecard(sprintId: string, phase: number): A
       for (const r of reviews) {
         if (!r.output) continue
         const lower = r.output.toLowerCase()
-        if (lower.includes('exceptional')) sum += 1.0
-        else if (lower.includes('solid') || lower.includes('strong')) sum += 0.7
-        else if (lower.includes('needs work') || lower.includes('missing')) sum += 0.3
-        else sum += 0.5
+        // Count positive and negative signal words (handles negation like "not exceptional")
+        const positiveWords = ['exceptional', 'excellent', 'outstanding', 'impressive', 'thorough', 'comprehensive']
+        const solidWords = ['solid', 'strong', 'good', 'competent', 'reliable', 'effective']
+        const negativeWords = ['needs work', 'missing', 'incomplete', 'weak', 'poor', 'insufficient', 'lacking']
+        const negationPattern = /\b(not|no|isn't|wasn't|hardly|barely|far from|never)\b/
+
+        // Check for negated positives (e.g., "not exceptional" = negative)
+        let posScore = 0
+        let negScore = 0
+        for (const word of positiveWords) {
+          const idx = lower.indexOf(word)
+          if (idx >= 0) {
+            // Check 30 chars before for negation
+            const prefix = lower.slice(Math.max(0, idx - 30), idx)
+            if (negationPattern.test(prefix)) negScore++
+            else posScore++
+          }
+        }
+        for (const word of solidWords) {
+          if (lower.includes(word)) posScore += 0.5
+        }
+        for (const word of negativeWords) {
+          if (lower.includes(word)) negScore++
+        }
+
+        const total = posScore + negScore
+        if (total === 0) sum += 0.5
+        else sum += Math.max(0, Math.min(1, posScore / total))
       }
       reviewQualityAvg = sum / reviews.length
     }
@@ -151,8 +175,14 @@ function calculateGrade(
   // Review quality: 25% weight
   score += reviewQuality * 25
 
-  // CFS (normalized to 0-1 range, assume max ~50): 15% weight
-  score += Math.min(cfsScore / 50, 1) * 15
+  // CFS: normalize dynamically against actual max across all agents
+  // (was hardcoded /50 which flattens once rainmaker bonuses accumulate)
+  const db = getDb()
+  const maxCfs = (db.query(`
+    SELECT MAX(collaboration_score) as m FROM agents
+  `).get() as { m: number | null })?.m ?? 1
+  const cfsCeiling = Math.max(maxCfs, 1) // avoid div by zero
+  score += Math.min(cfsScore / cfsCeiling, 1) * 15
 
   // Handoff rate: 10% weight
   score += handoffRate * 10

@@ -59,14 +59,14 @@ export function MessageBus({ messages }: MessageBusProps) {
             </div>
 
             {/* Subject */}
-            <div className="ml-[72px] text-[10px] text-text truncate mt-0.5">
+            <div className="ml-[72px] text-[10px] text-text break-words mt-0.5">
               {msg.subject}
             </div>
 
             {/* Body preview */}
             {msg.body && (
-              <div className="ml-[72px] text-[9px] text-muted truncate mt-0.5">
-                {msg.body.slice(0, 120)}
+              <div className="ml-[72px] text-[9px] text-muted break-words whitespace-pre-wrap mt-0.5">
+                {msg.body}
               </div>
             )}
           </div>

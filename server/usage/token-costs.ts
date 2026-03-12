@@ -12,6 +12,7 @@ import { getDb } from '../db/database'
 // Even on Claude Max (subscription), we track equivalent API cost
 // so we know the real resource consumption per agent.
 export const MODEL_PRICING: Record<string, { input: number; output: number; cacheWrite: number; cacheRead: number }> = {
+  // Anthropic models
   haiku: {
     input: 1.00,      // $1.00 / MTok
     output: 5.00,     // $5.00 / MTok
@@ -29,6 +30,45 @@ export const MODEL_PRICING: Record<string, { input: number; output: number; cach
     output: 25.00,    // $25.00 / MTok
     cacheWrite: 6.25, // 1.25x input = $6.25 / MTok
     cacheRead: 0.50,  // 0.1x input = $0.50 / MTok
+  },
+  // OpenAI models (used when provider = 'openai')
+  'gpt-4.1-mini': {
+    input: 0.40,      // $0.40 / MTok
+    output: 1.60,     // $1.60 / MTok
+    cacheWrite: 0.40,
+    cacheRead: 0.10,
+  },
+  'gpt-4.1': {
+    input: 2.00,      // $2.00 / MTok
+    output: 8.00,     // $8.00 / MTok
+    cacheWrite: 2.00,
+    cacheRead: 0.50,
+  },
+  'o3': {
+    input: 2.00,      // $2.00 / MTok (input)
+    output: 8.00,     // $8.00 / MTok (output)
+    cacheWrite: 2.00,
+    cacheRead: 0.50,
+  },
+  'o4-mini': {
+    input: 1.10,      // $1.10 / MTok
+    output: 4.40,     // $4.40 / MTok
+    cacheWrite: 1.10,
+    cacheRead: 0.28,
+  },
+  // Codex CLI models (same pricing as OpenAI API equivalents, but billed through subscription)
+  // Tracked here for equivalent-cost accounting even though subscription covers actual cost
+  'codex-o4-mini': {
+    input: 1.10,
+    output: 4.40,
+    cacheWrite: 1.10,
+    cacheRead: 0.28,
+  },
+  'codex-o3': {
+    input: 2.00,
+    output: 8.00,
+    cacheWrite: 2.00,
+    cacheRead: 0.50,
   },
 }
 

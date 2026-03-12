@@ -12,31 +12,61 @@ export interface Task {
 }
 
 // Enqueue a new task for an agent
+// priority: if true, task is placed at top of queue (started_at set to epoch)
+// Built-in dedup: rejects if agent already has a task with same description prefix
+// in the same phase (any status). This is the SINGLE chokepoint for all task creation.
 export function enqueueTask(params: {
   agentId: string
   type: string
   description: string
   phase: number
   input?: string
-}): string {
+  priority?: boolean
+}): string | null {
   const db = getDb()
+
+  // Dedup: check if this agent already has a task with matching description in this phase
+  // Exempt 'chat' tasks -- each human message is unique even with same prefix
+  if (params.type !== 'chat') {
+    const descPrefix = params.description.slice(0, 80)
+    const existing = db.query(`
+      SELECT id, status FROM actions
+      WHERE agent_id = ? AND phase = ? AND substr(description, 1, 80) = ?
+      LIMIT 1
+    `).get(params.agentId, params.phase, descPrefix) as { id: string; status: string } | null
+
+    if (existing) {
+      console.log(`[QUEUE:DEDUP] Blocked duplicate for ${params.agentId} (existing ${existing.id} ${existing.status}): ${descPrefix.slice(0, 60)}...`)
+      return null
+    }
+  }
+
   const id = crypto.randomUUID()
 
+  // Priority tasks get a started_at of epoch so they sort first in dequeue
+  // (dequeue ORDER BY started_at ASC -- NULL sorts after epoch)
+  const startedAt = params.priority ? '1970-01-01T00:00:00' : null
+
   db.run(`
-    INSERT INTO actions (id, agent_id, type, description, phase, status, input)
-    VALUES (?, ?, ?, ?, ?, 'queued', ?)
-  `, [id, params.agentId, params.type, params.description, params.phase, params.input ?? null])
+    INSERT INTO actions (id, agent_id, type, description, phase, status, input, started_at)
+    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+  `, [id, params.agentId, params.type, params.description, params.phase, params.input ?? null, startedAt])
 
   return id
 }
 
-// Dequeue the next task for an agent (respects phase gating)
+// Dequeue the next task for an agent (respects phase gating + blocker check)
 export function dequeueTask(agentId: string, currentPhase: number): Task | null {
   const db = getDb()
+
+  // Safety net: never dispatch to a blocked agent (defense-in-depth with getReadyAgents filter)
+  const agentStatus = db.query(`SELECT status FROM agents WHERE id = ?`).get(agentId) as { status: string } | null
+  if (agentStatus?.status === 'blocked') return null
 
   const task = db.query(`
     SELECT * FROM actions
     WHERE agent_id = ? AND status = 'queued' AND phase <= ?
+      AND (retry_after IS NULL OR retry_after <= datetime('now'))
     ORDER BY
       started_at ASC
     LIMIT 1

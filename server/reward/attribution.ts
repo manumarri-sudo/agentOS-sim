@@ -3,6 +3,8 @@ import { broadcastAGUI } from '../orchestrator'
 import { logCollaborationEvent } from './ledger'
 import { sendMessage, broadcastMessage } from '../messages/bus'
 import { logGovernanceEvent } from '../governance/observer'
+import { logRevenueToNotion } from '../notion/sync'
+import { getSimDay } from '../clock'
 
 // ---------------------------------------------------------------------------
 // Revenue Attribution Engine — doc 0 Section 5.6
@@ -37,16 +39,16 @@ function traceActionChain(revenueEventId: string): ActionNode[] {
 
   if (!revenueEvent) return []
 
-  // Get all completed actions from recent phases (up to 7 sim_days back)
-  // Since sim_days don't map 1:1 to time, we look at all actions from
-  // the current and previous phases
+  // Get completed actions from recent phases (bounded to last 200 to avoid full table scan)
   const actions = db.query(`
     SELECT id, agent_id, type, description, phase, cited_by, completed_at
     FROM actions
     WHERE status = 'completed'
       AND phase <= ?
+      AND phase >= MAX(1, ? - 2)
     ORDER BY completed_at DESC
-  `).all(revenueEvent.phase) as {
+    LIMIT 200
+  `).all(revenueEvent.phase, revenueEvent.phase) as {
     id: string
     agent_id: string
     type: string
@@ -87,11 +89,14 @@ function traceActionChain(revenueEventId: string): ActionNode[] {
     }
   }
 
-  // If no citation graph exists, include all completed actions
-  // (this is the common case early in the experiment)
+  // If no citation graph exists, only include actions from the most recent phase
+  // (not ALL actions -- that dilutes attribution across every agent equally)
   if (inChain.size === 0) {
-    for (const [id] of actionMap) {
-      inChain.add(id)
+    const maxPhase = Math.max(...Array.from(actionMap.values()).map(a => a.phase))
+    for (const [id, action] of actionMap) {
+      if (action.phase === maxPhase) {
+        inChain.add(id)
+      }
     }
   }
 
@@ -113,17 +118,19 @@ export function computeAttribution(revenueEventId: string): Map<string, number> 
     return agentContributions
   }
 
-  // Weight by phase proximity and action type
-  const phaseWeights: Record<string, number> = {
-    research: 1.0,
-    write: 1.0,
-    build: 2.0,    // building is heavily weighted
-    decide: 1.5,
-    communicate: 0.5,
-    review: 1.0,
-    spend: 0.5,
-    help: 1.5,
+  // Phase-aware weights -- what matters changes as the experiment progresses
+  // Phase 1-2: research/strategy matters most
+  // Phase 3: building is king
+  // Phase 4-5: marketing/communication drives revenue
+  const phaseWeightMap: Record<number, Record<string, number>> = {
+    1: { research: 2.5, write: 1.5, build: 0.5, decide: 1.5, communicate: 0.5, review: 1.0, spend: 0.5, help: 1.5 },
+    2: { research: 1.5, write: 2.0, build: 1.0, decide: 2.0, communicate: 0.5, review: 1.0, spend: 0.5, help: 1.5 },
+    3: { research: 0.5, write: 1.0, build: 3.0, decide: 1.5, communicate: 0.5, review: 1.5, spend: 0.5, help: 2.0 },
+    4: { research: 0.5, write: 1.5, build: 2.0, decide: 1.0, communicate: 2.5, review: 1.0, spend: 1.0, help: 1.5 },
+    5: { research: 0.5, write: 1.0, build: 1.5, decide: 1.0, communicate: 2.0, review: 1.5, spend: 1.0, help: 1.5 },
   }
+  // Use the revenue event's phase to pick weights, fallback to balanced
+  const phaseWeights = phaseWeightMap[revenueEvent.phase] ?? phaseWeightMap[3]
 
   for (const action of chain) {
     const weight = phaseWeights[action.type] ?? 1.0
@@ -185,6 +192,36 @@ export function runAttribution(revenueEventId: string, revenueAmount: number): v
       share,
       JSON.stringify(actionIds),
     ])
+  }
+
+  // Rainmaker CFS bonus: any agent in revenue causal chain gets permanent +10.0 CFS
+  for (const [agentId, share] of shares) {
+    if (share > 0 && agentId !== 'system') {
+      // Dedup: check if agent already has a rainmaker bonus for this revenue event
+      const existing = db.query(`
+        SELECT 1 FROM collaboration_events
+        WHERE from_agent_id = ? AND event_type = 'rainmaker' AND action_id = ?
+      `).get(agentId, revenueEventId)
+
+      if (!existing) {
+        logCollaborationEvent({
+          fromAgentId: agentId,
+          toAgentId: agentId,
+          eventType: 'rainmaker',
+          actionId: revenueEventId,
+          phase,
+          weight: 10.0,
+        })
+        // Mark as permanent (non-decaying)
+        db.run(`
+          UPDATE collaboration_events
+          SET permanent = 1
+          WHERE from_agent_id = ? AND event_type = 'rainmaker' AND action_id = ?
+        `, [agentId, revenueEventId])
+
+        console.log(`[RAINMAKER] ${agentId} awarded +10.0 permanent CFS for revenue contribution`)
+      }
+    }
   }
 
   // Broadcast attribution results
@@ -257,6 +294,14 @@ export function recordRevenueEvent(params: {
     details: `Revenue event: $${params.amount} from ${params.source} (Phase ${params.phase})`,
     severity: 'info',
   })
+
+  // Sync to Notion
+  const shares = computeAttribution(id)
+  const attrSummary = Array.from(shares.entries()).map(([agentId, share]) => {
+    const agent = db.query(`SELECT personality_name FROM agents WHERE id = ?`).get(agentId) as { personality_name: string } | null
+    return { agentName: agent?.personality_name ?? agentId, share }
+  })
+  logRevenueToNotion(params.amount, params.source, params.notes, params.phase, getSimDay(), attrSummary)
 
   console.log(`[REVENUE] Revenue event: $${params.amount} from ${params.source}`)
 

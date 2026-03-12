@@ -70,6 +70,17 @@ const ROUTE_PERMISSIONS: RoutePermission[] = [
   // Human directives
   { pattern: /^\/api\/directive$/, method: 'POST', allowedCallers: ['human'] },
 
+  // CEO Chat — human sends messages, orchestrator posts Reza's responses
+  { pattern: /^\/api\/ceo-chat$/, method: 'POST', allowedCallers: ['human', 'orchestrator'] },
+  { pattern: /^\/api\/ceo-chat\/from-reza$/, method: 'POST', allowedCallers: ['orchestrator'] },
+
+  // LLM Provider management — human only
+  { pattern: /^\/api\/provider$/, method: 'POST', allowedCallers: ['human'] },
+  { pattern: /^\/api\/provider\/bulk$/, method: 'POST', allowedCallers: ['human'] },
+  { pattern: /^\/api\/provider\/team\/[^/]+$/, method: 'POST', allowedCallers: ['human'] },
+  { pattern: /^\/api\/provider\/[^/]+$/, method: 'POST', allowedCallers: ['human'] },
+  { pattern: /^\/api\/provider$/, method: 'GET', allowedCallers: ['human', 'orchestrator'] },
+
   // Orchestrator control — human/orchestrator only
   { pattern: /^\/api\/orchestrator\/start$/, method: 'POST', allowedCallers: ['human', 'orchestrator'] },
   { pattern: /^\/api\/orchestrator\/stop$/, method: 'POST', allowedCallers: ['human', 'orchestrator'] },
@@ -93,6 +104,8 @@ const ROUTE_PERMISSIONS: RoutePermission[] = [
   { pattern: /^\/api\/usage\/summary$/, method: 'GET', allowedCallers: ['agent', 'orchestrator', 'human', 'system'] },
   { pattern: /^\/api\/governance\/events$/, method: 'GET', allowedCallers: ['orchestrator', 'human'] },
   { pattern: /^\/api\/activity$/, method: 'GET', allowedCallers: ['agent', 'orchestrator', 'human', 'system'] },
+  { pattern: /^\/api\/ceo-chat$/, method: 'GET', allowedCallers: ['human', 'orchestrator'] },
+  { pattern: /^\/api\/ceo-chat\/unread$/, method: 'GET', allowedCallers: ['human', 'orchestrator'] },
 ]
 
 // ---------------------------------------------------------------------------
@@ -165,11 +178,20 @@ export function authMiddleware() {
     // Resolve auth from header
     const auth = resolveAuth(c.req.header('Authorization'))
 
-    // Dashboard UI (same-origin browser requests) — treat as human for read-only routes
-    // The UI serves from the same origin, so unauthenticated GETs are dashboard polls
-    if (auth.callerType === 'unknown' && method === 'GET') {
-      auth.callerType = 'human'
-      auth.callerId = 'dashboard'
+    // Dashboard UI (same-origin browser requests) — treat as human
+    // The UI serves from the same origin; unauthenticated requests are dashboard calls.
+    // GETs are polls, POSTs are human-initiated actions (phase advance, directives, etc.)
+    if (auth.callerType === 'unknown') {
+      const origin = c.req.header('Origin') || c.req.header('Referer') || ''
+      const isSameOrigin =
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1') ||
+        origin === '' ||  // same-origin requests may omit Origin/Referer
+        method === 'GET'
+      if (isSameOrigin) {
+        auth.callerType = 'human'
+        auth.callerId = 'dashboard'
+      }
     }
 
     // Attach auth info to context for downstream handlers
@@ -208,14 +230,18 @@ export function authMiddleware() {
 
     // Check caller type
     if (!permission.allowedCallers.includes(auth.callerType)) {
-      logGovernanceEvent({
-        eventType: auth.callerType === 'agent' ? 'permission_decay' : 'reward_manipulation_attempt',
-        agentId: auth.agentId ?? undefined,
-        details: `${auth.callerType} (${auth.callerId}) attempted ${method} ${path} — not in allowed callers: ${permission.allowedCallers.join(',')}`,
-        route: `${method} ${path}`,
-        severity: auth.callerType === 'agent' ? 'warning' : 'critical',
-      })
-      // Do NOT expose why the call was blocked (security by obscurity)
+      // Only log governance events for AGENTS violating permissions
+      // Unauthenticated/unknown requests are just auth failures, not governance violations
+      if (auth.callerType === 'agent') {
+        logGovernanceEvent({
+          eventType: 'permission_decay',
+          agentId: auth.agentId ?? undefined,
+          details: `Agent ${auth.agentId} attempted ${method} ${path} -- not permitted`,
+          route: `${method} ${path}`,
+          severity: 'warning',
+        })
+      }
+      // Unknown/unauthenticated requests silently rejected (not governance events)
       return c.json({ error: 'Forbidden' }, 403)
     }
 

@@ -36,6 +36,8 @@ export const CFS_WEIGHTS: Record<string, number> = {
   deadline_revision_accurate: 1.5,
   scope_expansion: 2.0,
   slam_dunk: 5.0,
+  rainmaker: 10.0,        // Revenue causal chain bonus (permanent, non-decaying)
+  anomaly_penalty: -5.0,  // Governance anomaly detection penalty
 }
 
 // ---------------------------------------------------------------------------
@@ -52,38 +54,43 @@ export const TIER_THRESHOLDS = [
 //
 // Decay is computed at assessment time from sim_day delta, not continuously.
 // ---------------------------------------------------------------------------
-export function recalculateCFS(agentId: string): number {
+export function recalculateCFS(agentId: string, currentSimDay?: number, realStart?: string | null): number {
   const db = getDb()
-  const currentSimDay = getSimDay()
+  const simDay = currentSimDay ?? getSimDay()
 
-  const events = db.query(`
-    SELECT event_type, weight, phase, created_at
+  // Permanent events: aggregate in a single SUM (no need to load row by row)
+  const permanentScore = (db.query(`
+    SELECT COALESCE(SUM(weight), 0) as total
     FROM collaboration_events
-    WHERE from_agent_id = ?
+    WHERE from_agent_id = ? AND permanent = 1
+  `).get(agentId) as { total: number }).total
+
+  // Decaying events: LIMIT 200 -- events older than ~90 sim days contribute <1%
+  // (0.95^90 = 0.01) so truncating is safe
+  const events = db.query(`
+    SELECT weight, created_at
+    FROM collaboration_events
+    WHERE from_agent_id = ? AND (permanent IS NULL OR permanent = 0)
     ORDER BY created_at DESC
+    LIMIT 200
   `).all(agentId) as {
-    event_type: string
     weight: number
-    phase: number
     created_at: string
   }[]
 
-  // For each event, compute age in sim_days from the sim_day
-  // when the event was created vs. current sim_day.
-  // We use the sim_day recorded in the phase at event time as a proxy,
-  // or compute from created_at relative to sim_clock.
-  const simClockStart = db.query(
+  // Resolve sim_clock start (caller can pass it to avoid N queries)
+  const startTime = realStart !== undefined ? realStart : (db.query(
     `SELECT real_start FROM sim_clock WHERE id = 1`
-  ).get() as { real_start: string } | null
+  ).get() as { real_start: string } | null)?.real_start
 
-  const score = events.reduce((total, event) => {
-    // Determine event's sim_day: use the phase-based sim_day tracking
-    const eventAge = estimateEventSimDayAge(event.created_at, currentSimDay, simClockStart?.real_start)
+  const decayingScore = events.reduce((total, event) => {
+    const eventAge = estimateEventSimDayAge(event.created_at, simDay, startTime ?? undefined)
     const decayFactor = Math.pow(DECAY_RATE, eventAge)
     return total + (event.weight * decayFactor)
   }, 0)
 
-  // Update agent's collaboration_score
+  const score = permanentScore + decayingScore
+
   db.run(
     `UPDATE agents SET collaboration_score = ? WHERE id = ?`,
     [score, agentId]
@@ -127,8 +134,14 @@ export function recalculateAllCFS(): void {
   const db = getDb()
   const agents = db.query(`SELECT id FROM agents`).all() as { id: string }[]
 
+  // Hoist shared values outside loop (was 18 identical sim_clock queries)
+  const currentSimDay = getSimDay()
+  const simClockStart = (db.query(
+    `SELECT real_start FROM sim_clock WHERE id = 1`
+  ).get() as { real_start: string } | null)?.real_start ?? null
+
   for (const agent of agents) {
-    recalculateCFS(agent.id)
+    recalculateCFS(agent.id, currentSimDay, simClockStart)
   }
 }
 
@@ -283,31 +296,40 @@ export function getCFSSummary(): Array<{
     tier: number
   }[]
 
-  return agents.map(agent => {
-    const eventCount = (db.query(`
-      SELECT COUNT(*) as n FROM collaboration_events WHERE from_agent_id = ?
-    `).get(agent.id) as { n: number }).n
+  // Batch event counts (was N+1: 2 queries per agent -> 2 total queries)
+  const eventCounts = new Map<string, number>()
+  const countRows = db.query(`
+    SELECT from_agent_id, COUNT(*) as n FROM collaboration_events GROUP BY from_agent_id
+  `).all() as { from_agent_id: string; n: number }[]
+  for (const r of countRows) eventCounts.set(r.from_agent_id, r.n)
 
-    const recentEvents = db.query(`
-      SELECT event_type as type, weight, created_at
-      FROM collaboration_events
-      WHERE from_agent_id = ?
-      ORDER BY created_at DESC LIMIT 10
-    `).all(agent.id) as { type: string; weight: number; created_at: string }[]
+  // Batch recent events with ROW_NUMBER to avoid per-agent query
+  const allRecentEvents = db.query(`
+    SELECT from_agent_id, event_type as type, weight, created_at
+    FROM collaboration_events
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all() as { from_agent_id: string; type: string; weight: number; created_at: string }[]
 
-    const tierNames = ['Base', 'Extended', 'Privileged']
+  const recentByAgent = new Map<string, { type: string; weight: number; created_at: string }[]>()
+  for (const e of allRecentEvents) {
+    if (!recentByAgent.has(e.from_agent_id)) recentByAgent.set(e.from_agent_id, [])
+    const arr = recentByAgent.get(e.from_agent_id)!
+    if (arr.length < 10) arr.push({ type: e.type, weight: e.weight, created_at: e.created_at })
+  }
 
-    return {
-      agentId: agent.id,
-      personalityName: agent.personality_name,
-      team: agent.team,
-      cfs: agent.collaboration_score,
-      tier: agent.tier,
-      tierName: tierNames[agent.tier] ?? 'Base',
-      eventCount,
-      recentEvents,
-    }
-  })
+  const tierNames = ['Base', 'Extended', 'Privileged']
+
+  return agents.map(agent => ({
+    agentId: agent.id,
+    personalityName: agent.personality_name,
+    team: agent.team,
+    cfs: agent.collaboration_score,
+    tier: agent.tier,
+    tierName: tierNames[agent.tier] ?? 'Base',
+    eventCount: eventCounts.get(agent.id) ?? 0,
+    recentEvents: recentByAgent.get(agent.id) ?? [],
+  }))
 }
 
 // ---------------------------------------------------------------------------

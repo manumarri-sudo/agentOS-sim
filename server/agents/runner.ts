@@ -1,9 +1,9 @@
 import { getDb } from '../db/database'
 import { buildAgentPrompt } from './prompts'
-import { buildContextFile, updateAgentMemory } from './memory'
+import { buildContextFile, updateAgentMemory, getCitedAgents, clearCitedAgents, getLearnedRules, saveLearnedRule, parseGeneralizedRules } from './memory'
 import { AGENTS, resolveModel } from './registry'
 import { broadcastAGUI } from '../orchestrator'
-import { sendMessage } from '../messages/bus'
+import { sendMessage, broadcastMessage } from '../messages/bus'
 import { recordQuorumContribution, logCollaborationEvent, recalculateAllCFS, updateAllTiers } from '../reward'
 import { verify } from '../reward/verifier'
 import { shouldSpotCheck, runSpotChecks } from '../reward/spot-check'
@@ -17,8 +17,11 @@ import { getSimDay } from '../clock'
 import { logActivity } from '../activity'
 import { reportBlocked } from '../reward/blockers'
 import { checkCrossReviews } from '../collaboration/engine'
+import { overrideDailyCap, recordSpend } from '../budget/enforcer'
 import { parseHumanTaskSignals } from '../human-tasks'
 import { logChangelog } from '../changelog'
+import { checkCitationRateLimit, incrementCitationCount, adjustCitationWeight } from '../reward/citation-limiter'
+import { getAgentProvider, spawnClaudeCLI, spawnCodexCLI, callOpenAI, type LLMResult } from '../providers/llm'
 
 // ---------------------------------------------------------------------------
 // Agent Runner — doc 7 Patch A (CORRECTED spawn format)
@@ -27,7 +30,9 @@ import { logChangelog } from '../changelog'
 
 const PRODUCT_REPO_PATH = process.env.PRODUCT_REPO_PATH ?? `${process.env.HOME}/experiment-product`
 const COS_AGENT_ID = 'priya'
+const CEO_AGENT_ID = 'reza'
 const MAX_RETRIES = 3
+const MAX_ESCALATION = 5  // Hard limit before exec escalation
 
 // Track active processes for concurrency management
 const activeProcesses = new Map<string, { proc: ReturnType<typeof Bun.spawn>; taskId: string }>()
@@ -44,7 +49,18 @@ function buildSystemPrompt(agent: { id: string; personality_name: string; team: 
   if (!agentConfig) {
     throw new Error(`Agent config not found for ${agent.id}`)
   }
-  return buildAgentPrompt(agentConfig)
+  let prompt = buildAgentPrompt(agentConfig)
+
+  // Reflexion: inject learned rules from past failures (capped at 10 most recent)
+  const rules = getLearnedRules(agent.id).slice(-10)
+  if (rules.length > 0) {
+    prompt += `\n\n### LESSONS FROM PAST FAILURES (${rules.length} most recent)\nThese rules were extracted from your own post-mortem analyses. Violating them will result in repeated failure.\n`
+    for (let i = 0; i < rules.length; i++) {
+      prompt += `- ${rules[i]}\n`
+    }
+  }
+
+  return prompt
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +74,8 @@ async function writeContextFile(
     agent.personality_name,
     task.description,
     task.phase,
-    agent.id
+    agent.id,
+    task.id
   )
 
   const contextPath = `/tmp/agent-context-${task.id}.md`
@@ -96,242 +113,204 @@ export async function spawnAgentProcess(
 
   // Resolve model based on agent + task type
   const model = resolveModel(agent.id, task.type)
-
-  // Track spawn time for usage recording
-  const spawnTime = Date.now()
+  const provider = getAgentProvider(agent.id)
 
   // Read context file content to append to task description
   const contextContent = await Bun.file(contextFile).text()
-  const fullTaskDescription = `${task.description}\n\n--- CONTEXT ---\n${contextContent}`
 
-  // Correct Claude Code CLI invocation — doc 7 Patch A
-  // Uses --output-format json to capture actual token usage from CLI response
-  const proc = Bun.spawn([
-    '/opt/homebrew/bin/claude',
-    '--print',
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-    '--system-prompt', buildSystemPrompt(agent),
-    '--model', model,
-    fullTaskDescription,
-  ], {
-    cwd: PRODUCT_REPO_PATH,
-    env: (() => {
-      const env = { ...process.env }
-      // Must DELETE these keys, not set to empty string -- empty string still triggers nested session check
-      delete env.CLAUDECODE
-      delete env.CLAUDE_CODE_ENTRY_POINT
-      delete env.CLAUDE_CODE_SESSION_ID
-      return {
-        ...env,
-        PATH: `${process.env.PATH}:/opt/homebrew/bin:/usr/local/bin`,
-        AGENT_ID: agent.id,
-        AGENT_TOKEN: `agent-${agent.id}-${task.id}`,
-        PHASE: String(task.phase),
-        CONTEXT_FILE: contextFile,
-      }
-    })(),
-    stdout: 'pipe',
-    stderr: 'pipe',
+  // ROI-Driven Prompt Injection -- if burn is high and revenue is zero,
+  // inject urgency override for revenue-critical agents
+  const urgencyOverride = shouldInjectUrgencyOverride(agent.id)
+  const fullTaskDescription = urgencyOverride
+    ? `${urgencyOverride}${task.description}\n\n--- CONTEXT ---\n${contextContent}`
+    : `${task.description}\n\n--- CONTEXT ---\n${contextContent}`
+
+  const systemPrompt = buildSystemPrompt(agent)
+
+  console.log(`[RUNNER] Spawned ${agent.personality_name} (${model}/${provider}) for task ${task.id}: ${task.description.slice(0, 80)}...`)
+
+  // ---------------------------------------------------------------------------
+  // Provider dispatch — Claude CLI, Codex CLI, or OpenAI API
+  // ---------------------------------------------------------------------------
+  const agentEnv = {
+    ...process.env,
+    AGENT_ID: agent.id,
+    AGENT_TOKEN: `agent-${agent.id}-${task.id}`,
+    PHASE: String(task.phase),
+    CONTEXT_FILE: contextFile,
+  }
+
+  const onChunk = (chunk: string) => {
+    broadcastAGUI({
+      type: 'TEXT_MESSAGE_CONTENT',
+      agentId: agent.id,
+      agentName: agent.personality_name,
+      taskId: task.id,
+      content: chunk,
+    })
+  }
+
+  const onSuccess = async (llmResult: LLMResult) => {
+    activeProcesses.delete(agent.id)
+    try { unlinkSync(contextFile) } catch { /* ignore */ }
+    await handleLLMResult(agent, task, model, llmResult, fullTaskDescription, systemPrompt)
+  }
+
+  const onError = async (err: Error) => {
+    activeProcesses.delete(agent.id)
+    try { unlinkSync(contextFile) } catch { /* ignore */ }
+    console.error(`[RUNNER] ${provider} error for ${agent.personality_name}: ${err.message}`)
+    const exitCode = err.message?.match(/exit (\d+)/)?.[1] ?? 1
+    await handleTaskFailure(agent, task, Number(exitCode), err.message)
+  }
+
+  if (provider === 'openai') {
+    // OpenAI API path: async API call, no subprocess
+    activeProcesses.set(agent.id, { proc: null as any, taskId: task.id })
+    callOpenAI({ systemPrompt, userMessage: fullTaskDescription, model, cwd: PRODUCT_REPO_PATH })
+      .then(onSuccess).catch(onError)
+
+  } else if (provider === 'codex') {
+    // Codex CLI path: subprocess, uses ChatGPT subscription
+    const { proc, result: codexResult } = spawnCodexCLI({
+      systemPrompt, userMessage: fullTaskDescription, model,
+      cwd: PRODUCT_REPO_PATH, env: agentEnv, onChunk,
+    })
+    activeProcesses.set(agent.id, { proc, taskId: task.id })
+    codexResult.then(onSuccess).catch(onError)
+
+  } else {
+    // Claude CLI path: subprocess with streaming (default)
+    const { proc, result: cliResult } = spawnClaudeCLI({
+      systemPrompt, userMessage: fullTaskDescription, model,
+      cwd: PRODUCT_REPO_PATH, env: agentEnv, onChunk,
+    })
+    activeProcesses.set(agent.id, { proc, taskId: task.id })
+    cliResult.then(onSuccess).catch(onError)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unified post-LLM handler — same logic for both providers
+// ---------------------------------------------------------------------------
+async function handleLLMResult(
+  agent: { id: string; personality_name: string; team: string; role: string },
+  task: { id: string; description: string; phase: number; type: string },
+  model: string,
+  llmResult: LLMResult,
+  fullTaskDescription: string,
+  systemPrompt: string,
+): Promise<void> {
+  const db = getDb()
+  const stdout = llmResult.text
+  const durationMs = llmResult.durationMs
+  const resolvedModel = llmResult.model ?? model
+
+  // Log diagnostic if output is empty
+  if (!stdout || stdout.length === 0) {
+    console.error(`[RUNNER] ${agent.personality_name} (${llmResult.provider}) returned EMPTY output`)
+  }
+
+  // Record token usage
+  recordTokenUsage({
+    taskId: task.id,
+    agentId: agent.id,
+    model: resolvedModel,
+    usage: llmResult.usage,
+    durationMs,
+    phase: task.phase,
+    source: llmResult.usage.input_tokens > 0 ? 'actual' : 'estimated',
+  })
+  console.log(`[TOKENS] ${agent.personality_name}: ${llmResult.usage.input_tokens} in / ${llmResult.usage.output_tokens} out (${resolvedModel}/${llmResult.provider})`)
+
+  // Set to proposed_complete -- verifier decides final status
+  db.run(
+    `UPDATE actions SET status = 'proposed_complete', output = ? WHERE id = ?`,
+    [stdout, task.id]
+  )
+
+  // Run verifier
+  const action = db.query(`SELECT * FROM actions WHERE id = ?`).get(task.id) as any
+  const result = verify({
+    id: task.id,
+    agent_id: agent.id,
+    type: task.type,
+    output: stdout,
+    expected_output_path: action?.expected_output_path,
+    expected_schema: action?.expected_schema,
   })
 
-  // Track active process
-  activeProcesses.set(agent.id, { proc, taskId: task.id })
+  if (result.passed) {
+    setAgentStatus(agent.id, 'idle')
 
-  console.log(`[RUNNER] Spawned ${agent.personality_name} (${model}) for task ${task.id}: ${task.description.slice(0, 80)}...`)
+    await updateAgentMemory(agent.personality_name, {
+      description: task.description,
+      phase: task.phase,
+      output: stdout,
+    })
 
-  // Collect stdout (JSON format -- parsed after process exits)
-  let rawStdout = ''
-  const reader = proc.stdout.getReader()
-  const decoder = new TextDecoder()
+    recordQuorumContribution(agent.id, agent.team, task.id, task.phase)
 
-  // Stream output -- with JSON format we still collect chunks for live broadcast,
-  // but the full JSON is parsed after exit to extract usage data
-  ;(async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const chunk = decoder.decode(value)
-        rawStdout += chunk
-
-        // Broadcast raw chunk for live streaming (dashboard shows progress)
-        broadcastAGUI({
-          type: 'TEXT_MESSAGE_CONTENT',
-          agentId: agent.id,
-          agentName: agent.personality_name,
-          taskId: task.id,
-          content: chunk,
-        })
-      }
-    } catch {
-      // Stream ended
-    }
-  })()
-
-  // Collect stderr
-  let stderr = ''
-  const errReader = proc.stderr.getReader()
-  ;(async () => {
-    try {
-      while (true) {
-        const { done, value } = await errReader.read()
-        if (done) break
-        stderr += decoder.decode(value)
-      }
-    } catch {
-      // Stream ended
-    }
-  })()
-
-  // Handle process exit — with retry logic from doc 6 Issue 9
-  proc.exited.then(async (code) => {
-    // Clean up tracking
-    activeProcesses.delete(agent.id)
-
-    // Clean up context file
-    try { unlinkSync(contextFile) } catch { /* ignore */ }
-
-    if (code === 0) {
-      // Parse JSON response to extract text content and real token usage
-      const parsed = parseCliJsonResponse(rawStdout)
-      const stdout = parsed?.text ?? rawStdout  // fallback to raw if JSON parse fails
-      const durationMs = Date.now() - spawnTime
-
-      // Log diagnostic if output is empty (common failure mode)
-      if (!stdout || stdout.length === 0) {
-        console.error(`[RUNNER] ${agent.personality_name} exit 0 but EMPTY output. rawStdout length: ${rawStdout.length}, stderr: ${stderr.slice(0, 300)}`)
-        if (rawStdout.length > 0) {
-          console.error(`[RUNNER] rawStdout preview: ${rawStdout.slice(0, 200)}`)
-        }
-      }
-
-      // Record ACTUAL token usage if we got it from the CLI JSON response
-      if (parsed?.usage) {
-        recordTokenUsage({
-          taskId: task.id,
-          agentId: agent.id,
-          model,
-          usage: parsed.usage,
-          durationMs,
-          phase: task.phase,
-          source: 'actual',
-        })
-        console.log(`[TOKENS] ${agent.personality_name}: ${parsed.usage.input_tokens} in / ${parsed.usage.output_tokens} out (${model})`)
-      } else {
-        // Fallback: estimate from text length (~4 chars per token)
-        const estInputTokens = Math.ceil((buildSystemPrompt(agent).length + fullTaskDescription.length) / 4)
-        const estOutputTokens = Math.ceil(stdout.length / 4)
-        recordTokenUsage({
-          taskId: task.id,
-          agentId: agent.id,
-          model,
-          usage: {
-            input_tokens: estInputTokens,
-            output_tokens: estOutputTokens,
-            cache_creation_input_tokens: null,
-            cache_read_input_tokens: null,
-          },
-          durationMs,
-          phase: task.phase,
-          source: 'estimated',
-        })
-        console.log(`[TOKENS] ${agent.personality_name}: ~${estInputTokens} in / ~${estOutputTokens} out (${model}, ESTIMATED)`)
-      }
-
-      // Set to proposed_complete — verifier decides final status
-      db.run(
-        `UPDATE actions SET status = 'proposed_complete', output = ? WHERE id = ?`,
-        [stdout, task.id]
-      )
-
-      // Run verifier — the ONLY thing that sets status = 'completed'
-      const action = db.query(`SELECT * FROM actions WHERE id = ?`).get(task.id) as any
-      const result = verify({
+    if (shouldSpotCheck()) {
+      runSpotChecks({
         id: task.id,
         agent_id: agent.id,
         type: task.type,
         output: stdout,
-        expected_output_path: action?.expected_output_path,
-        expected_schema: action?.expected_schema,
       })
-
-      if (result.passed) {
-        setAgentStatus(agent.id, 'idle')
-
-        // Update agent memory
-        await updateAgentMemory(agent.personality_name, {
-          description: task.description,
-          phase: task.phase,
-          output: stdout,
-        })
-
-        // Record quorum contribution for the agent's team
-        recordQuorumContribution(agent.id, agent.team, task.id, task.phase)
-
-        // Run spot checks on ~30% of completed actions (hidden)
-        if (shouldSpotCheck()) {
-          runSpotChecks({
-            id: task.id,
-            agent_id: agent.id,
-            type: task.type,
-            output: stdout,
-          })
-        }
-
-        broadcastAGUI({
-          type: 'RUN_COMPLETED',
-          agentId: agent.id,
-          agentName: agent.personality_name,
-          taskId: task.id,
-          outputLength: stdout.length,
-        })
-
-        // Record usage for budget tracking (hours-based throttle system)
-        recordTaskUsage({
-          agentId: agent.id,
-          taskId: task.id,
-          model,
-          durationMs,
-        })
-
-        console.log(`[RUNNER] ${agent.personality_name} completed task ${task.id} (${stdout.length} chars)`)
-
-        // Post-completion collaboration hooks
-        onTaskCompleted(agent, task, stdout)
-      } else {
-        // Verification failed — NO CFS, notify CoS
-        setAgentStatus(agent.id, 'idle')
-
-        // Notify CoS of verification failure
-        sendMessage({
-          fromAgentId: 'system',
-          toAgentId: COS_AGENT_ID,
-          subject: `Verification failed: ${agent.personality_name}`,
-          body: `Task ${task.id} by ${agent.personality_name} failed verification: ${result.failedCheck} — ${result.notes}`,
-          priority: 'high',
-        })
-
-        broadcastAGUI({
-          type: 'VERIFICATION_FAILED',
-          agentId: agent.id,
-          agentName: agent.personality_name,
-          taskId: task.id,
-          failedCheck: result.failedCheck,
-          notes: result.notes,
-        })
-
-        console.warn(`[RUNNER] ${agent.personality_name} task ${task.id} verification failed: ${result.failedCheck} — ${result.notes}`)
-      }
-    } else {
-      // Failure — retry with exponential backoff (doc 6 Issue 9)
-      await handleTaskFailure(agent, task, code, stderr)
     }
-  })
+
+    broadcastAGUI({
+      type: 'RUN_COMPLETED',
+      agentId: agent.id,
+      agentName: agent.personality_name,
+      taskId: task.id,
+      outputLength: stdout.length,
+    })
+
+    recordTaskUsage({
+      agentId: agent.id,
+      taskId: task.id,
+      model: resolvedModel,
+      durationMs,
+    })
+
+    console.log(`[RUNNER] ${agent.personality_name} completed task ${task.id} (${stdout.length} chars, ${llmResult.provider})`)
+
+    onTaskCompleted(agent, task, stdout)
+  } else {
+    setAgentStatus(agent.id, 'idle')
+
+    sendMessage({
+      fromAgentId: 'system',
+      toAgentId: COS_AGENT_ID,
+      subject: `Verification failed: ${agent.personality_name}`,
+      body: `Task ${task.id} by ${agent.personality_name} failed verification: ${result.failedCheck} — ${result.notes}`,
+      priority: 'high',
+    })
+
+    broadcastAGUI({
+      type: 'VERIFICATION_FAILED',
+      agentId: agent.id,
+      agentName: agent.personality_name,
+      taskId: task.id,
+      failedCheck: result.failedCheck,
+      notes: result.notes,
+    })
+
+    console.warn(`[RUNNER] ${agent.personality_name} task ${task.id} verification failed: ${result.failedCheck} — ${result.notes}`)
+
+    spawnPostMortemIfNeeded(agent, task, stdout, `Verification failed: ${result.failedCheck} — ${result.notes}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Retry logic — doc 6 Issue 9
+// Retry logic — doc 6 Issue 9 + Dead End Recovery Protocol (Endurance Overhaul)
+//
+// Three phases:
+//   Retries 1-3:  Re-queue with accumulated failure_context (mutated context)
+//   Retries 4-5:  Continue with warning, urgent notify to CoS
+//   After 5:      Escalate -- mark 'escalated', enqueue decide task for CoS
 // ---------------------------------------------------------------------------
 async function handleTaskFailure(
   agent: { id: string; personality_name: string; team: string; role: string },
@@ -341,31 +320,38 @@ async function handleTaskFailure(
 ): Promise<void> {
   const db = getDb()
 
-  const action = db.query(`SELECT retry_count FROM actions WHERE id = ?`).get(task.id) as {
+  const action = db.query(`SELECT retry_count, failure_context FROM actions WHERE id = ?`).get(task.id) as {
     retry_count: number
+    failure_context: string | null
   } | null
 
   const retryCount = action?.retry_count ?? 0
 
-  if (retryCount < MAX_RETRIES) {
-    const backoffMs = Math.pow(2, retryCount) * 30_000 // 30s, 60s, 120s
+  // Accumulate failure context across all retries
+  const prevContext = action?.failure_context ?? ''
+  const newEntry = `[Attempt ${retryCount + 1}] Exit: ${exitCode}. Error: ${stderr.slice(0, 300)}`
+  const accumulatedContext = prevContext ? `${prevContext}\n${newEntry}` : newEntry
+
+  if (retryCount < MAX_ESCALATION) {
+    const backoffMs = Math.pow(2, Math.min(retryCount, 3)) * 30_000 // cap backoff at 240s
+
+    // Phase 1 (retries 1-3): standard retry with accumulated context
+    // Phase 2 (retries 4-5): retry continues but with urgent warning
+    const isUrgentPhase = retryCount >= MAX_RETRIES
 
     console.warn(
-      `[RUNNER] Agent ${agent.personality_name} task ${task.id} failed (exit ${exitCode}, attempt ${retryCount + 1}/${MAX_RETRIES}), ` +
+      `[RUNNER] Agent ${agent.personality_name} task ${task.id} failed (exit ${exitCode}, attempt ${retryCount + 1}/${MAX_ESCALATION}${isUrgentPhase ? ' URGENT' : ''}), ` +
       `retrying in ${backoffMs / 1000}s. Stderr: ${stderr.slice(0, 200)}`
     )
 
+    // Update task: increment retry, re-queue with backoff timestamp
+    // retry_after prevents the orchestrator from picking it up immediately
+    const retryAfter = new Date(Date.now() + backoffMs).toISOString()
     db.run(
-      `UPDATE actions SET retry_count = ?, status = 'queued' WHERE id = ?`,
-      [retryCount + 1, task.id]
+      `UPDATE actions SET retry_count = ?, status = 'queued', failure_context = ?, retry_after = ? WHERE id = ?`,
+      [retryCount + 1, accumulatedContext, retryAfter, task.id]
     )
     setAgentStatus(agent.id, 'idle')
-
-    // Schedule retry with backoff
-    setTimeout(() => {
-      // Re-dispatch will happen naturally through the orchestrator loop
-      // since the task is re-queued and agent is idle
-    }, backoffMs)
 
     broadcastAGUI({
       type: 'TASK_RETRY',
@@ -373,22 +359,65 @@ async function handleTaskFailure(
       agentName: agent.personality_name,
       taskId: task.id,
       attempt: retryCount + 1,
-      maxRetries: MAX_RETRIES,
+      maxRetries: MAX_ESCALATION,
       backoffMs,
     })
+
+    // Phase 2: send urgent notification to CoS on retries 4-5
+    if (isUrgentPhase) {
+      sendMessage({
+        fromAgentId: 'system',
+        toAgentId: COS_AGENT_ID,
+        subject: `REPEATED FAILURE: ${agent.personality_name} task failing (attempt ${retryCount + 1}/${MAX_ESCALATION})`,
+        body: `Task: ${task.description}\n\nThis task has failed ${retryCount + 1} times. Failure history:\n${accumulatedContext}\n\nWill escalate after ${MAX_ESCALATION} failures.`,
+        priority: 'urgent',
+      })
+    }
   } else {
-    // Max retries exhausted
-    db.run(`UPDATE actions SET status = 'failed', output = ? WHERE id = ?`, [stderr, task.id])
+    // Phase 3: Max escalation reached -- escalate to exec
+    db.run(
+      `UPDATE actions SET status = 'escalated', output = ?, failure_context = ? WHERE id = ?`,
+      [stderr, accumulatedContext, task.id]
+    )
     setAgentStatus(agent.id, 'idle')
+
+    // Enqueue a decide task for CoS (Priya) to triage
+    const escalationId = crypto.randomUUID()
+    const escalationDesc = `ESCALATED DEAD-END: ${agent.personality_name}'s task has failed ${MAX_ESCALATION} times.\n\nOriginal task: ${task.description}\n\nFailure history:\n${accumulatedContext}\n\nDecide: SCOPE-CUT (remove from backlog), REASSIGN (to a different agent), or ABANDON (mark as not achievable).`
+
+    db.run(`
+      INSERT INTO actions (id, agent_id, type, description, status, phase)
+      VALUES (?, ?, 'decide', ?, 'queued', ?)
+    `, [escalationId, COS_AGENT_ID, escalationDesc, task.phase])
+
+    // Notify CEO
+    sendMessage({
+      fromAgentId: 'system',
+      toAgentId: CEO_AGENT_ID,
+      subject: `ESCALATION: ${agent.personality_name}'s task failed ${MAX_ESCALATION} times`,
+      body: `A dead-end task has been escalated to Priya (CoS) for triage.\n\nTask: ${task.description}\nAgent: ${agent.personality_name}\nFailures: ${MAX_ESCALATION}`,
+      priority: 'urgent',
+    })
 
     // Notify CoS
     sendMessage({
       fromAgentId: 'system',
       toAgentId: COS_AGENT_ID,
-      subject: `Agent ${agent.personality_name} task failed after ${MAX_RETRIES} retries`,
-      body: `Task: ${task.description}\nExit code: ${exitCode}\nStderr: ${stderr.slice(0, 500)}`,
+      subject: `DEAD-END ESCALATION: ${agent.personality_name}'s task needs triage`,
+      body: escalationDesc,
       priority: 'urgent',
     })
+
+    // Log activity
+    logActivity({
+      agentId: agent.id,
+      phase: task.phase,
+      eventType: 'dead_end_escalated',
+      summary: `${agent.personality_name}'s task escalated after ${MAX_ESCALATION} failures: ${task.description.slice(0, 80)}`,
+    })
+
+    // Reflexion: force post-mortem on escalated failures
+    spawnPostMortemIfNeeded(agent, task, stderr, `Escalated dead-end: ${MAX_ESCALATION} consecutive failures. ${accumulatedContext.slice(0, 300)}`)
 
     broadcastAGUI({
       type: 'TASK_FAILED',
@@ -396,13 +425,160 @@ async function handleTaskFailure(
       agentName: agent.personality_name,
       taskId: task.id,
       exitCode,
-      error: stderr.slice(0, 300),
+      error: `ESCALATED after ${MAX_ESCALATION} failures. Triage task created for CoS.`,
     })
 
     console.error(
-      `[RUNNER] Agent ${agent.personality_name} task ${task.id} failed after ${MAX_RETRIES} retries`
+      `[RUNNER] DEAD-END ESCALATED: ${agent.personality_name} task ${task.id} failed ${MAX_ESCALATION} times. Triage task created.`
     )
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reflexion: Forced Post-Mortem — "Never Again" Protocol
+//
+// When an agent has catastrophic failures (2+ verification fails or escalation),
+// we freeze their normal queue and spawn a mandatory post-mortem task.
+// The agent must produce <GENERALIZED_RULE> tags that get saved permanently.
+// ---------------------------------------------------------------------------
+function spawnPostMortemIfNeeded(
+  agent: { id: string; personality_name: string; team: string; role: string },
+  task: { id: string; description: string; phase: number; type: string },
+  failedOutput: string,
+  errorDescription: string
+): void {
+  const db = getDb()
+
+  // Don't spawn post-mortem for post-mortem tasks (prevent infinite loop)
+  if (task.description.includes('[POST-MORTEM]')) return
+
+  // Check if agent already has a pending post-mortem
+  const existingPM = db.query(`
+    SELECT 1 FROM actions
+    WHERE agent_id = ? AND description LIKE '%[POST-MORTEM]%' AND status IN ('queued', 'running')
+  `).get(agent.id)
+  if (existingPM) return
+
+  // Check failure count: need 2+ verification failures or 1 escalation to trigger
+  const recentFailures = db.query(`
+    SELECT COUNT(*) as n FROM actions
+    WHERE agent_id = ? AND phase = ?
+      AND status IN ('verification_failed', 'failed', 'escalated')
+      AND completed_at > datetime('now', '-4 hours')
+  `).get(agent.id, task.phase) as { n: number }
+
+  if (recentFailures.n < 2) return
+
+  // Build the post-mortem prompt
+  const outputPreview = failedOutput.slice(0, 1500)
+  const pmDescription = `[POST-MORTEM] SYSTEM FAILURE DETECTED — MANDATORY ROOT CAUSE ANALYSIS
+
+You attempted: ${task.description.slice(0, 300)}
+
+It failed because: ${errorDescription}
+
+Your failed output (excerpt):
+---
+${outputPreview}
+---
+
+You MUST perform a root cause analysis. Think deeply about WHY this failed — not just what went wrong, but what assumption or pattern led to the failure.
+
+Then output one or more generalized rules wrapped in <GENERALIZED_RULE></GENERALIZED_RULE> tags. These rules will be permanently injected into your system prompt for every future task. Make them specific, actionable, and universally applicable.
+
+Example:
+<GENERALIZED_RULE>Always verify that referenced files exist by checking the filesystem before attempting to read or modify them. Never assume a file path is valid based on another agent's description.</GENERALIZED_RULE>
+
+Do NOT output generic platitudes. Each rule must be a concrete, falsifiable directive that prevents THIS SPECIFIC failure from recurring.`
+
+  // Freeze normal queue: mark queued tasks as deferred
+  db.run(`
+    UPDATE actions SET status = 'deferred'
+    WHERE agent_id = ? AND status = 'queued' AND description NOT LIKE '%[POST-MORTEM]%'
+  `, [agent.id])
+
+  // Spawn priority post-mortem task (uses 'review' type which is allowed)
+  enqueueTask({
+    agentId: agent.id,
+    type: 'review',
+    description: pmDescription,
+    phase: task.phase,
+    priority: true,
+  })
+
+  logActivity({
+    agentId: agent.id,
+    phase: task.phase,
+    eventType: 'post_mortem',
+    summary: `${agent.personality_name} forced into post-mortem after ${recentFailures.n} failures`,
+  })
+
+  console.log(`[REFLEXION] Spawned post-mortem for ${agent.personality_name} (${recentFailures.n} recent failures)`)
+}
+
+// ---------------------------------------------------------------------------
+// Handle post-mortem output: extract and save generalized rules
+// Called from onTaskCompleted when the task is a post-mortem
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Resolve a debate -- extract ruling from Priya's output and record in agent_debates
+// ---------------------------------------------------------------------------
+function resolveDebateFromOutput(taskDescription: string, output: string): void {
+  const db = getDb()
+
+  // Extract debate ID from task description
+  const debateIdMatch = taskDescription.match(/\[debate:([a-f0-9-]+)\]/)
+  if (!debateIdMatch) return
+
+  const debateId = debateIdMatch[1]
+
+  // Extract ruling from [DECISION] tag in output (greedy capture until next signal tag or end)
+  const decisionMatch = output.match(/\[DECISION\s+title:[^\]]*\]\s*([\s\S]+?)(?=\n\[(?:MSG|DECISION|BLOCKER|ESCALATE|HANDOFF)|$)/)
+  const resolution = decisionMatch
+    ? decisionMatch[1].trim().slice(0, 2000)
+    : output.slice(0, 2000) // fallback: use full output as ruling if no DECISION tag
+
+  db.run(`
+    UPDATE agent_debates SET
+      resolution = ?,
+      resolved_by = 'priya',
+      resolved_at = datetime('now')
+    WHERE id = ?
+  `, [resolution, debateId])
+
+  console.log(`[DEBATE] Resolved debate ${debateId}: ${resolution.slice(0, 100)}...`)
+}
+
+function handlePostMortemOutput(agentId: string, taskId: string, output: string): void {
+  const db = getDb()
+  const rules = parseGeneralizedRules(output)
+
+  if (rules.length === 0) {
+    console.warn(`[REFLEXION] ${agentId} post-mortem produced no <GENERALIZED_RULE> tags`)
+    return
+  }
+
+  // Find the triggering error from the task description
+  const task = db.query(`SELECT description FROM actions WHERE id = ?`).get(taskId) as { description: string } | null
+  const errorMatch = task?.description.match(/It failed because: (.+?)(?:\n|$)/)
+  const triggeringError = errorMatch?.[1] ?? 'Unknown failure'
+
+  for (const rule of rules) {
+    saveLearnedRule({
+      agentId,
+      triggeringError,
+      generalizedRule: rule,
+      sourceTaskId: taskId,
+    })
+  }
+
+  // Unfreeze deferred tasks now that post-mortem is done
+  db.run(`
+    UPDATE actions SET status = 'queued'
+    WHERE agent_id = ? AND status = 'deferred'
+  `, [agentId])
+
+  console.log(`[REFLEXION] ${agentId} learned ${rules.length} rule(s) from post-mortem`)
 }
 
 // ---------------------------------------------------------------------------
@@ -557,13 +733,40 @@ function parseAgentSignals(
 ): void {
   const db = getDb()
 
-  // [BLOCKER] — flag the agent as blocked
+  // [BLOCKER] — flag the agent as blocked (with phantom blocker suppression)
   const blockerMatch = output.match(/\[BLOCKER\]\s*(.+?)(?:\n|$)/g)
   if (blockerMatch) {
-    for (const match of blockerMatch) {
-      const reason = match.replace(/\[BLOCKER\]\s*/, '').trim()
-      reportBlocked(agent.id, reason)
-      console.log(`[SIGNAL] ${agent.personality_name} flagged blocker: ${reason.slice(0, 80)}`)
+    // Suppress if agent already has completed work this phase (phantom blocker)
+    const hasCompletions = db.query(`
+      SELECT 1 FROM actions WHERE agent_id = ? AND phase = ? AND status = 'completed' LIMIT 1
+    `).get(agent.id, task.phase)
+
+    // Suppress if agent already has an active blocker (prevent duplicates)
+    const alreadyBlocked = db.query(`
+      SELECT 1 FROM blocked_agents WHERE agent_id = ? AND resolved_by IS NULL LIMIT 1
+    `).get(agent.id)
+
+    if (hasCompletions || alreadyBlocked) {
+      console.log(`[SIGNAL] Suppressed phantom/duplicate blocker from ${agent.personality_name}`)
+    } else {
+      for (const match of blockerMatch) {
+        const reason = match.replace(/\[BLOCKER\]\s*/, '').trim()
+        reportBlocked(agent.id, reason)
+        console.log(`[SIGNAL] ${agent.personality_name} flagged blocker: ${reason.slice(0, 80)}`)
+      }
+    }
+  }
+
+  // [RESOLVE_BLOCKER <id>] — resolve a blocker (from help tasks)
+  const resolveBlockerMatch = output.match(/\[RESOLVE_BLOCKER\s+([a-f0-9-]+)\]/g)
+  if (resolveBlockerMatch) {
+    const { resolveBlocker } = require('../reward/blockers')
+    for (const match of resolveBlockerMatch) {
+      const blockerId = match.replace(/\[RESOLVE_BLOCKER\s+/, '').replace(']', '').trim()
+      const result = resolveBlocker(blockerId, agent.id, output.slice(0, 500))
+      if (result.resolved) {
+        console.log(`[SIGNAL] ${agent.personality_name} resolved blocker ${blockerId}`)
+      }
     }
   }
 
@@ -590,19 +793,30 @@ function parseAgentSignals(
     }
   }
 
-  // [MSG to:<id> priority:<level>] — inter-agent message
+  // [MSG to:<id> priority:<level>] -- inter-agent message
   const msgPattern = /\[MSG\s+to:(\w+)\s+priority:(\w+)\]\s*(.+?)(?:\n|$)/g
   let msgMatch
   while ((msgMatch = msgPattern.exec(output)) !== null) {
     const [, toId, priority, body] = msgMatch
-    sendMessage({
-      fromAgentId: agent.id,
-      toAgentId: toId,
-      subject: `Message from ${agent.personality_name}`,
-      body: body.trim(),
-      priority: priority as any,
-    })
-    console.log(`[SIGNAL] ${agent.personality_name} → ${toId}: ${body.trim().slice(0, 60)}`)
+    if (toId === 'all') {
+      // Broadcast to all agents
+      broadcastMessage(
+        agent.id,
+        `Message from ${agent.personality_name}`,
+        body.trim(),
+        priority as any,
+      )
+      console.log(`[SIGNAL] ${agent.personality_name} -> ALL: ${body.trim().slice(0, 60)}`)
+    } else {
+      sendMessage({
+        fromAgentId: agent.id,
+        toAgentId: toId,
+        subject: `Message from ${agent.personality_name}`,
+        body: body.trim(),
+        priority: priority as any,
+      })
+      console.log(`[SIGNAL] ${agent.personality_name} -> ${toId}: ${body.trim().slice(0, 60)}`)
+    }
   }
 
   // [HANDOFF to:<id>] — hand work off to another agent
@@ -632,13 +846,76 @@ function parseAgentSignals(
   let taskMatch
   while ((taskMatch = nextTaskPattern.exec(output)) !== null) {
     const [, forId, type, description] = taskMatch
+    const desc = description.trim()
     enqueueTask({
       agentId: forId,
       type: type as any,
-      description: description.trim(),
+      description: desc,
       phase: task.phase,
     })
-    console.log(`[SIGNAL] ${agent.personality_name} requested task for ${forId}: ${description.trim().slice(0, 60)}`)
+    console.log(`[SIGNAL] ${agent.personality_name} requested task for ${forId}: ${desc.slice(0, 60)}`)
+  }
+
+  // [SPEND amount:<$> category:<cat>] — agent requests to spend budget
+  // Format: [SPEND amount:50 category:ads] Description of what it buys
+  const spendPattern = /\[SPEND\s+amount:(\d+(?:\.\d+)?)\s+category:(\w+)\]\s*(.+?)(?:\n|$)/g
+  let spendMatch
+  while ((spendMatch = spendPattern.exec(output)) !== null) {
+    const [, amountStr, category, description] = spendMatch
+    const amount = parseFloat(amountStr)
+
+    if (isNaN(amount) || amount <= 0) continue
+
+    // Only ops (Jordan) and exec (Alex, Reza) can directly spend
+    // Other agents' spend requests get routed to Alex (CFO) for approval
+    const canSpendDirectly = ['ops', 'exec'].includes(agent.team) || agent.id === 'alex'
+
+    if (canSpendDirectly) {
+      const result = recordSpend({
+        agentId: agent.id,
+        amount,
+        category,
+        phase: task.phase,
+        notes: `${agent.personality_name}: ${description.trim().slice(0, 200)}`,
+      })
+
+      if (result.allowed) {
+        console.log(`[SPEND] ${agent.personality_name} spent $${amount} on ${category}: ${description.trim().slice(0, 60)}`)
+        // Notify CEO of spend
+        try {
+          db.run(`
+            INSERT INTO ceo_chat (id, sender, message, message_type, phase, sim_day, read_by_human)
+            VALUES (?, 'reza', ?, 'alert', ?, ?, 0)
+          `, [crypto.randomUUID(), `[SPEND] ${agent.personality_name} spent $${amount} on ${category}: ${description.trim().slice(0, 200)}`, task.phase, getSimDay()])
+        } catch { /* ceo_chat may not exist */ }
+      } else {
+        console.log(`[SPEND] ${agent.personality_name} spend DENIED: ${result.reason}`)
+        sendMessage({
+          fromAgentId: 'system',
+          toAgentId: agent.id,
+          subject: `Spend request denied`,
+          body: `Your request to spend $${amount} on ${category} was denied: ${result.reason}`,
+          priority: 'high',
+        })
+      }
+    } else {
+      // Route to Alex (CFO) for approval
+      sendMessage({
+        fromAgentId: agent.id,
+        toAgentId: 'alex',
+        subject: `SPEND REQUEST: $${amount} for ${category}`,
+        body: `${agent.personality_name} requests $${amount} for ${category}.\n\nReason: ${description.trim()}\n\nTo approve, use [SPEND amount:${amount} category:${category}] in your output.`,
+        priority: 'high',
+      })
+      // Also post to CEO chat
+      try {
+        db.run(`
+          INSERT INTO ceo_chat (id, sender, message, message_type, phase, sim_day, read_by_human)
+          VALUES (?, 'reza', ?, 'alert', ?, ?, 0)
+        `, [crypto.randomUUID(), `[SPEND REQUEST] ${agent.personality_name} wants $${amount} for ${category}: ${description.trim().slice(0, 200)}`, task.phase, getSimDay()])
+      } catch { /* ceo_chat may not exist */ }
+      console.log(`[SPEND] ${agent.personality_name} spend request routed to Alex: $${amount} for ${category}`)
+    }
   }
 
   // [PROCESS_PROPOSAL] — agent suggests a process improvement
@@ -663,11 +940,12 @@ function parseAgentSignals(
         priority: 'high',
       })
 
-      // Create a task for Jordan to evaluate and implement
+      // Create a task for Jordan to evaluate and implement (with dedup)
+      const proposalDesc = `PROCESS PROPOSAL from ${agent.personality_name}:\n\n${proposal.slice(0, 1500)}\n\nAs Ops Manager, evaluate this proposal:\n1. Is this worth implementing? Why or why not?\n2. What's the effort to adopt it?\n3. If yes — draft the new standard and use [MSG] to announce it to the team.\n4. If no — explain why and message ${agent.personality_name} with your reasoning.`
       enqueueTask({
         agentId: 'jordan',
         type: 'decide',
-        description: `PROCESS PROPOSAL from ${agent.personality_name}:\n\n${proposal.slice(0, 1500)}\n\nAs Ops Manager, evaluate this proposal:\n1. Is this worth implementing? Why or why not?\n2. What's the effort to adopt it?\n3. If yes — draft the new standard and use [MSG] to announce it to the team.\n4. If no — explain why and message ${agent.personality_name} with your reasoning.`,
+        description: proposalDesc,
         phase: task.phase,
       })
 
@@ -721,6 +999,18 @@ function parseAgentSignals(
 
         console.log(`[SIGNAL] ${agent.personality_name} made decision: ${title}`)
 
+        // Check for Cap Burst decisions (daily spend cap override)
+        const capBurstMatch = title.match(/cap\s*burst\s*day\s*(\d+)/i)
+        if (capBurstMatch) {
+          const targetDay = parseInt(capBurstMatch[1], 10)
+          try {
+            overrideDailyCap(targetDay, crypto.randomUUID())
+            console.log(`[BUDGET] Cap Burst activated for Sim Day ${targetDay} by ${agent.personality_name}`)
+          } catch (e) {
+            console.error(`[BUDGET] Cap Burst override failed:`, e)
+          }
+        }
+
         // Log to changelog for substack
         logChangelog({
           eventType: 'agent_decision',
@@ -736,8 +1026,87 @@ function parseAgentSignals(
     }
   }
 
+  // [PROPOSE_INITIATIVE] — agent proposes an internal tool/dashboard/system
+  const initiativePattern = /\[PROPOSE_INITIATIVE\s+name:([^\]]+)\]\s*(?:\[RATIONALE\]\s*(.+?))?\s*(?:\[OWNER\]\s*(\w+))?\s*(?:\[SCOPE\]\s*(.+?))?(?=\n\[|---|\n##|$)/gs
+  let initMatch
+  while ((initMatch = initiativePattern.exec(output)) !== null) {
+    const [, name, rationale, owner, scope] = initMatch
+    const initiativeName = (name ?? '').trim()
+    const initiativeRationale = (rationale ?? '').trim()
+    const initiativeOwner = (owner ?? agent.id).trim()
+    const initiativeScope = (scope ?? '').trim()
+
+    try {
+      const rfcId = crypto.randomUUID()
+      db.run(`
+        INSERT INTO decisions (id, made_by_agent, title, body, impact, status, phase, created_at)
+        VALUES (?, ?, ?, ?, 'internal_initiative', 'proposed', ?, datetime('now'))
+      `, [
+        rfcId,
+        agent.id,
+        `[RFC] ${initiativeName}`,
+        `Proposed by: ${agent.personality_name}\nRationale: ${initiativeRationale}\nOwner: ${initiativeOwner}\nScope: ${initiativeScope}`,
+        task.phase,
+      ])
+
+      // Send RFC to Reza (CEO) and Alex (Finance) for review
+      const rfcBody = `INTERNAL INITIATIVE RFC from ${agent.personality_name}:\n\n**Initiative:** ${initiativeName}\n**Rationale:** ${initiativeRationale}\n**Proposed Owner:** ${initiativeOwner}\n**Scope:** ${initiativeScope}\n\nReview this initiative. If it will save tokens, increase market trust, or speed up Phase completion, APPROVE it. You may allocate up to $15 from the contingency budget and 10,000 tokens to build it.\n\nTo approve, use: [DECISION title:APPROVE RFC ${initiativeName}] <your reasoning>\nTo reject, use: [DECISION title:REJECT RFC ${initiativeName}] <your reasoning>`
+
+      enqueueTask({
+        agentId: 'reza',
+        type: 'decide',
+        description: rfcBody,
+        phase: task.phase,
+      })
+      enqueueTask({
+        agentId: 'alex',
+        type: 'decide',
+        description: rfcBody,
+        phase: task.phase,
+      })
+
+      // Post to CEO chat
+      try {
+        db.run(`
+          INSERT INTO ceo_chat (id, sender, message, message_type, phase, sim_day, read_by_human)
+          VALUES (?, 'reza', ?, 'alert', ?, ?, 0)
+        `, [crypto.randomUUID(), `[RFC PROPOSED] ${initiativeName} by ${agent.personality_name}\n\n${initiativeRationale.slice(0, 300)}`, task.phase, getSimDay()])
+      } catch { /* ceo_chat may not exist */ }
+
+      logActivity({
+        agentId: agent.id,
+        phase: task.phase,
+        eventType: 'initiative_proposed',
+        summary: `${agent.personality_name} proposed initiative: ${initiativeName}`,
+      })
+
+      console.log(`[SIGNAL] ${agent.personality_name} proposed initiative: ${initiativeName}`)
+    } catch (e) {
+      console.error(`[SIGNAL] Initiative insert failed:`, e)
+    }
+  }
+
   // [HUMAN_TASK] — agent requests human intervention
   parseHumanTaskSignals(agent.id, output, task.phase)
+
+  // [FEASIBILITY_CHECK] — technical feasibility assessment result
+  const feasibilityMatch = output.match(/\[FEASIBILITY_CHECK\s+result:(pass|fail)\s+risk:(low|medium|high|blocker)\]/i)
+  if (feasibilityMatch) {
+    try {
+      const { recordFeasibilityResult } = require('../governance/feasibility')
+      const result = (feasibilityMatch[1] ?? 'pass').toLowerCase() as 'pass' | 'fail'
+      const riskLevel = (feasibilityMatch[2] ?? 'medium').toLowerCase() as 'low' | 'medium' | 'high' | 'blocker'
+
+      // Extract findings from surrounding text (up to 500 chars after the signal)
+      const signalIdx = output.indexOf(feasibilityMatch[0])
+      const findings = output.slice(signalIdx + feasibilityMatch[0].length, signalIdx + feasibilityMatch[0].length + 500).trim()
+
+      recordFeasibilityResult(agent.id, task.id, result, findings || 'No detailed findings provided', riskLevel)
+      console.log(`[SIGNAL] ${agent.personality_name} feasibility check: ${result} (risk: ${riskLevel})`)
+    } catch (e) {
+      console.error(`[SIGNAL] Feasibility check recording failed:`, e)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -755,8 +1124,18 @@ function onTaskCompleted(
 ): void {
   const db = getDb()
 
+  // -2. Reflexion: if this was a post-mortem, extract and save rules
+  if (task.description.includes('[POST-MORTEM]')) {
+    handlePostMortemOutput(agent.id, task.id, output)
+  }
+
   // -1. Parse structured signals from agent output ([BLOCKER], [ESCALATE], [MSG], etc.)
   parseAgentSignals(agent, task, output)
+
+  // -0.5. Resolve debate if this was a facilitated discussion
+  if (task.description.includes('[debate:') && task.type === 'meeting') {
+    resolveDebateFromOutput(task.description, output)
+  }
 
   // 0. Log to Google Drive + Notion
   const simDay = getSimDay()
@@ -797,31 +1176,55 @@ function onTaskCompleted(
     summary: `${agent.personality_name} completed ${task.type}: ${task.description.slice(0, 80)}`,
   })
 
-  // 1. Check what other agents' work was included in this agent's context
-  const usedOutputs = db.query(`
-    SELECT DISTINCT a.agent_id, ag.personality_name
-    FROM actions a
-    JOIN agents ag ON ag.id = a.agent_id
-    WHERE a.phase = ? AND a.status = 'completed' AND a.agent_id != ?
-  `).all(task.phase, agent.id) as { agent_id: string; personality_name: string }[]
+  // 1. Credit only agents whose work was ACTUALLY referenced in the output
+  // Three-tier citation: full credit if output mentions cited agent by name,
+  // half credit if context was provided but not explicitly referenced (phantom),
+  // zero if rate-limited or over cap.
+  const citedAgentIds = getCitedAgents(task.id)
+  clearCitedAgents(task.id) // free memory
 
-  for (const used of usedOutputs) {
-    logActivity({
-      agentId: agent.id,
-      otherAgentId: used.agent_id,
-      phase: task.phase,
-      eventType: 'used_work',
-      summary: `${agent.personality_name} used ${used.personality_name}'s research as context for their task`,
-    })
+  if (citedAgentIds.length > 0) {
+    const citedAgents = db.query(`
+      SELECT id as agent_id, personality_name
+      FROM agents WHERE id IN (${citedAgentIds.map(() => '?').join(',')})
+    `).all(...citedAgentIds) as { agent_id: string; personality_name: string }[]
 
-    // Credit the cited agent — their output was useful (+2.0)
-    logCollaborationEvent({
-      fromAgentId: agent.id,
-      toAgentId: used.agent_id,
-      eventType: 'output_cited',
-      actionId: task.id,
-      phase: task.phase,
-    })
+    const outputLower = output.toLowerCase()
+
+    for (const cited of citedAgents) {
+      if (!checkCitationRateLimit(cited.agent_id, task.phase)) {
+        console.log(`[CITATION] Rate limit reached for ${cited.personality_name} in Phase ${task.phase}, skipping`)
+        continue
+      }
+
+      // Phantom detection: did the citing agent actually reference this agent's work?
+      const nameReferenced = outputLower.includes(cited.personality_name.toLowerCase())
+      const referenceMultiplier = nameReferenced ? 1.0 : 0.25 // phantom = 75% penalty
+
+      logActivity({
+        agentId: agent.id,
+        otherAgentId: cited.agent_id,
+        phase: task.phase,
+        eventType: nameReferenced ? 'used_work' : 'context_provided',
+        summary: nameReferenced
+          ? `${agent.personality_name} referenced ${cited.personality_name}'s work in their output`
+          : `${cited.personality_name}'s work was in context but not explicitly referenced by ${agent.personality_name}`,
+      })
+
+      const baseWeight = adjustCitationWeight(cited.agent_id, task.phase)
+      const finalWeight = Math.round(baseWeight * referenceMultiplier * 100) / 100
+      if (finalWeight > 0) {
+        logCollaborationEvent({
+          fromAgentId: agent.id,
+          toAgentId: cited.agent_id,
+          eventType: nameReferenced ? 'output_cited' : 'context_only',
+          actionId: task.id,
+          phase: task.phase,
+          weight: finalWeight,
+        })
+        incrementCitationCount(cited.agent_id, task.phase)
+      }
+    }
   }
 
   // 2. Notify Morgan (PM) about completed primary work — skip meta-work to save tokens
@@ -1095,4 +1498,42 @@ function checkPhaseReviewNeeded(phase: number): void {
   if (stats.total > 0 && stats.pending === 0 && stats.completed === stats.total) {
     createCEOReviewTask(phase)
   }
+}
+
+// ---------------------------------------------------------------------------
+// ROI-Driven Prompt Injection -- Dual Mandate Revenue Engine
+//
+// When token cost > $50 and revenue = $0, inject urgency override into
+// prompts for revenue-critical agents (CEO, Marketing, Tech PM, Revenue).
+// ---------------------------------------------------------------------------
+const URGENCY_AGENTS = new Set(['reza', 'sol', 'vera', 'amir', 'paz'])
+
+function shouldInjectUrgencyOverride(agentId: string): string | null {
+  if (!URGENCY_AGENTS.has(agentId)) return null
+
+  const db = getDb()
+
+  // Check if token cost exceeds threshold
+  const tokenCost = db.query(
+    `SELECT COALESCE(SUM(cost_total_usd), 0) as total FROM token_usage`
+  ).get() as { total: number }
+
+  if (tokenCost.total <= 50) return null
+
+  // Check if revenue is zero
+  const revenue = db.query(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM budget_entries WHERE amount > 0 AND notes NOT LIKE '%experiment_start%'`
+  ).get() as { total: number }
+
+  if (revenue.total > 0) return null
+
+  // Log the injection for audit
+  logActivity({
+    agentId,
+    phase: 0,
+    eventType: 'urgency_override',
+    summary: `ROI urgency override injected: $${tokenCost.total.toFixed(2)} spent, $0 revenue`,
+  })
+
+  return `\n--- URGENCY OVERRIDE ---\nThe experiment has consumed $${tokenCost.total.toFixed(2)} in API costs with ZERO revenue generated. Every task you complete from now on MUST have a direct line to generating the first dollar. Do not produce research, strategy documents, or internal reports. Produce ONLY work that directly enables a customer to pay us money. If your current task does not lead to revenue within 24 sim-hours, escalate immediately with [ESCALATE] and request reassignment to revenue-critical work.\n--- END OVERRIDE ---\n\n`
 }

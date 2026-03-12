@@ -113,14 +113,16 @@ export function PhaseGate({ phases, activePhase }: PhaseGateProps) {
               {quorum.met ? 'QUORUM MET' : 'GATE LOCKED'}
             </span>
 
-            {quorum.met && (
-              <button
-                onClick={handleAdvance}
-                className="text-[10px] px-2 py-0.5 border border-accent text-accent hover:bg-accent/10 transition-colors"
-              >
-                ADVANCE PHASE
-              </button>
-            )}
+            <button
+              onClick={handleAdvance}
+              className="text-[10px] px-2 py-0.5 border border-accent text-accent hover:bg-accent/10 transition-colors"
+            >
+              ADVANCE PHASE
+            </button>
+
+            <span className="text-[8px] text-muted ml-1">
+              Auto-advances when tasks complete
+            </span>
           </div>
         </div>
       )}

@@ -4,6 +4,7 @@ import { logActivity } from '../activity'
 import { getSimDay } from '../clock'
 import { generatePerformanceScorecard } from '../performance/tracker'
 import { runRosterReview } from '../performance/roster'
+import { logPhaseReportToNotion } from '../notion/sync'
 
 // ---------------------------------------------------------------------------
 // Sprint Manager -- structured cadence for the experiment
@@ -76,21 +77,12 @@ export function startSprint(phase: number): string {
     WHERE phase = ? AND status = 'queued' AND sprint_id IS NULL
   `, [id, phase])
 
-  // Notify Morgan (PM) to manage this sprint
-  sendMessage({
-    fromAgentId: 'system',
-    toAgentId: 'morgan',
-    subject: `Sprint ${number} started`,
-    body: `New sprint started. Goal: ${goal}\n\n${queuedCount.n} tasks are assigned to this sprint. Track completion, enforce handoffs, and flag any blocked agents.`,
-    priority: 'high',
-  })
-
-  // Broadcast sprint start to all agents
+  // Broadcast sprint start to all agents (includes Morgan)
   broadcastMessage(
     'system',
     `Sprint ${number} started`,
-    `Sprint ${number} is now active. Phase: ${phaseInfo?.name}. Focus on completing your assigned tasks and using [HANDOFF] tags when passing work downstream.`,
-    'normal',
+    `Sprint ${number} is now active. Phase: ${phaseInfo?.name}. Goal: ${goal}\n\n${queuedCount.n} tasks assigned. Focus on completing your assigned tasks and using [HANDOFF] tags when passing work downstream.`,
+    'high',
   )
 
   logActivity({
@@ -169,6 +161,21 @@ function generateSprintReport(sprintId: string, sprintNumber: number, phase: num
     ORDER BY completed DESC
   `).all(sprintId) as any[]
 
+  // Also gather phase-wide stats if sprint-specific is empty
+  const phaseStats = agentStats.length === 0
+    ? db.query(`
+        SELECT a.agent_id, ag.personality_name, ag.team,
+          COUNT(*) as total,
+          SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) as completed,
+          SUM(CASE WHEN a.status = 'failed' THEN 1 ELSE 0 END) as failed
+        FROM actions a
+        JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.phase = ?
+        GROUP BY a.agent_id
+        ORDER BY completed DESC
+      `).all(phase) as any[]
+    : agentStats
+
   // Active blockers
   const blockers = db.query(`
     SELECT ba.reason, ag.personality_name
@@ -182,29 +189,67 @@ function generateSprintReport(sprintId: string, sprintNumber: number, phase: num
     SELECT SUM(amount) as total FROM budget_entries
   `).get() as { total: number }
 
-  const teamReports = agentStats.map((a: any) =>
-    `${a.personality_name} (${a.team}): ${a.completed}/${a.total} completed, ${a.failed} failed`
-  ).join('\n')
+  const tokenSpend = db.query(`
+    SELECT COALESCE(SUM(cost_total_usd), 0) as cost FROM token_usage
+  `).get() as { cost: number }
+
+  // Build readable team reports
+  const teams = new Map<string, string[]>()
+  for (const a of phaseStats) {
+    if (!teams.has(a.team)) teams.set(a.team, [])
+    teams.get(a.team)!.push(
+      `  ${a.personality_name}: ${a.completed}/${a.total} done` +
+      (a.failed > 0 ? ` (${a.failed} failed)` : '')
+    )
+  }
+  let teamReports = ''
+  for (const [team, lines] of teams) {
+    teamReports += `${team.toUpperCase()}:\n${lines.join('\n')}\n\n`
+  }
 
   const blockerText = blockers.length > 0
-    ? blockers.map((b: any) => `${b.personality_name}: ${b.reason.slice(0, 100)}`).join('\n')
-    : 'None'
+    ? blockers.map((b: any) => `${b.personality_name}: ${b.reason.slice(0, 120)}`).join('\n')
+    : null
 
-  const summary = `Sprint ${sprintNumber} Report (Phase ${phase})\n\nDelivery: ${stats.completed}/${stats.total} tasks completed (${stats.failed} failed)\nBlockers: ${blockers.length}\nBudget remaining: $${budget?.total ?? 0}`
+  // Compute actual totals from phase if sprint stats are empty
+  const actualCompleted = stats.completed || phaseStats.reduce((s: number, a: any) => s + (a.completed ?? 0), 0)
+  const actualTotal = stats.total || phaseStats.reduce((s: number, a: any) => s + (a.total ?? 0), 0)
+  const actualFailed = stats.failed || phaseStats.reduce((s: number, a: any) => s + (a.failed ?? 0), 0)
+  const rate = actualTotal > 0 ? Math.round((actualCompleted / actualTotal) * 100) : 0
+
+  const summary = `Sprint ${sprintNumber} Review -- Day ${simDay}, Phase ${phase}\n\n` +
+    `Delivery: ${actualCompleted}/${actualTotal} tasks completed (${rate}% success rate)\n` +
+    `Failures: ${actualFailed}\n` +
+    `Blockers: ${blockers.length} unresolved\n` +
+    `Budget: $${(budget?.total ?? 200).toFixed(2)} remaining, $${tokenSpend.cost.toFixed(2)} spent on tokens`
 
   db.run(`
-    INSERT INTO experiment_reports (id, trigger_type, phase, author_agent, summary, team_reports, blockers, budget_remaining, created_at)
-    VALUES (?, 'sprint_review', ?, 'morgan', ?, ?, ?, ?, datetime('now'))
+    INSERT INTO experiment_reports
+      (id, trigger_type, phase, author_agent, summary, team_reports, blockers,
+       budget_spent, budget_remaining, revenue_to_date, next_priority)
+    VALUES (?, 'sprint_review', ?, 'morgan', ?, ?, ?, ?, ?, 0, ?)
   `, [
-    crypto.randomUUID(),
+    `sprint-${sprintNumber}-p${phase}-${Date.now()}`,
     phase,
     summary,
-    teamReports,
+    teamReports || null,
     blockerText,
-    budget?.total ?? 0,
+    tokenSpend.cost,
+    budget?.total ?? 200,
+    blockers.length > 0
+      ? `Resolve ${blockers.length} blockers before next sprint`
+      : actualFailed > actualCompleted
+        ? `Failure rate too high -- investigate root causes`
+        : `Continue execution. ${rate}% completion rate.`,
   ])
 
-  console.log(`[SPRINT] Report generated for Sprint ${sprintNumber}`)
+  // Sync to Notion
+  logPhaseReportToNotion('sprint_review', phase, getSimDay(), summary, teamReports || null,
+    blockers.length > 0
+      ? `Resolve ${blockers.length} blockers before next sprint`
+      : `Continue execution. ${rate}% completion rate.`)
+
+  console.log(`[SPRINT] Report generated for Sprint ${sprintNumber}: ${actualCompleted}/${actualTotal} tasks`)
 }
 
 // Called from orchestrator main loop
@@ -212,12 +257,33 @@ export function checkSprintBoundary(cycleCount: number, phase: number): void {
   const current = getCurrentSprint()
 
   if (!current) {
-    // No active sprint -- start one
     startSprint(phase)
+    planSprintTasks(phase)
     return
   }
 
   if (shouldStartNewSprint(cycleCount)) {
     startSprint(phase)
+    planSprintTasks(phase)
+  }
+}
+
+// Generate dynamic tasks at sprint start based on completed work
+function planSprintTasks(phase: number): void {
+  try {
+    const { generateDynamicTasks } = require('../intelligence/analyzer')
+    const { enqueueTask } = require('../tasks/queue')
+
+    const tasks = generateDynamicTasks(phase)
+    let created = 0
+    for (const t of tasks) {
+      const id = enqueueTask(t)
+      if (id) created++
+    }
+    if (created > 0) {
+      console.log(`[SPRINT] Planned ${created} dynamic tasks for new sprint (Phase ${phase})`)
+    }
+  } catch (e) {
+    console.error('[SPRINT] Dynamic task planning error:', e)
   }
 }

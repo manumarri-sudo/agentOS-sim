@@ -66,7 +66,7 @@ export function ActivityFeed({ events }: ActivityFeedProps) {
                   </span>
                 )}
                 {ev.taskDescription && (
-                  <div className="text-muted text-[10px] truncate mt-0.5">
+                  <div className="text-muted text-[10px] break-words mt-0.5">
                     {ev.taskDescription}
                   </div>
                 )}
@@ -74,7 +74,7 @@ export function ActivityFeed({ events }: ActivityFeedProps) {
                   <div className="text-warn text-[10px] mt-0.5">{ev.reason}</div>
                 )}
                 {ev.error && (
-                  <div className="text-danger text-[10px] mt-0.5 truncate">{ev.error}</div>
+                  <div className="text-danger text-[10px] mt-0.5 break-words">{ev.error}</div>
                 )}
               </div>
             </div>

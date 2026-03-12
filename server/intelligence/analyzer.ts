@@ -224,24 +224,25 @@ export function scoreContextRelevance(
   taskDescription: string,
   agentId: string,
   phase: number
-): Array<{ agentName: string; description: string; output: string; score: number }> {
+): Array<{ agentId: string; agentName: string; description: string; output: string; score: number }> {
   const db = getDb()
 
   const completed = db.query(`
-    SELECT a.description, substr(a.output, 1, 2000) as output, ag.personality_name as agentName
+    SELECT a.agent_id as agentId, a.description, substr(a.output, 1, 2000) as output, ag.personality_name as agentName
     FROM actions a JOIN agents ag ON ag.id = a.agent_id
     WHERE a.phase = ? AND a.status = 'completed' AND a.agent_id != ?
     ORDER BY a.completed_at DESC LIMIT 20
   `).all(phase, agentId) as any[]
 
-  const taskWords = extractKeywords(taskDescription)
+  // Expand task keywords with concept synonyms for semantic matching
+  const taskWords = extractKeywords(taskDescription, true)
 
   return completed.map((item: any) => {
-    const descWords = extractKeywords(item.description)
+    const descWords = extractKeywords(item.description, true)
     const outputWords = extractKeywords(item.output.slice(0, 500))
     const allWords = new Set([...descWords, ...outputWords])
 
-    // Score = keyword overlap
+    // Score = keyword overlap (now includes concept synonyms)
     let score = 0
     for (const word of taskWords) {
       if (allWords.has(word)) score += 1
@@ -306,10 +307,11 @@ export function generatePhaseTasks(targetPhase: number): Array<{
     ORDER BY a.completed_at ASC
   `).all(previousPhase) as any[]
 
-  if (priorWork.length === 0) return []
-
-  // Extract key findings from prior work
+  // Extract key findings from prior work (may be empty for phases with hardcoded tasks like Phase 3)
   const allOutputText = priorWork.map((w: any) => w.output?.slice(0, 1000) ?? '').join('\n')
+
+  // For Phase 2, we need prior work to build task descriptions -- skip if nothing completed yet
+  if (priorWork.length === 0 && targetPhase === 2) return []
 
   // Check what gaps exist
   const gaps = analyzePhaseGaps(targetPhase)
@@ -439,15 +441,239 @@ export function generatePhaseTasks(targetPhase: number): Array<{
     })
   }
 
-  // Filter out tasks that would duplicate existing queued/running tasks
+  // Filter out tasks that would duplicate existing tasks in ANY state
+  // Previously only checked queued/running -- causing 13x duplication when failed tasks
+  // got regenerated every 30 cycles
   const existing = db.query(`
-    SELECT agent_id, type, description FROM actions
-    WHERE phase = ? AND status IN ('queued', 'running')
-  `).all(targetPhase) as any[]
+    SELECT agent_id, type, substr(description, 1, 80) as desc_prefix, status FROM actions
+    WHERE phase = ?
+  `).all(targetPhase) as { agent_id: string; type: string; desc_prefix: string; status: string }[]
 
   return tasks.filter(t => {
-    return !existing.some((e: any) => e.agent_id === t.agentId && e.type === t.type)
+    const descPrefix = t.description.slice(0, 80)
+    // Skip if this agent already has ANY task of this type+description in this phase
+    // (completed, failed, verification_failed, queued, running -- doesn't matter)
+    const hasDuplicate = existing.some(e =>
+      e.agent_id === t.agentId && e.type === t.type && e.desc_prefix === descPrefix
+    )
+    if (hasDuplicate) return false
+    // Also skip if agent already has a completed task of this type (they did the work)
+    const hasCompleted = existing.some(e =>
+      e.agent_id === t.agentId && e.type === t.type && e.status === 'completed'
+    )
+    return !hasCompleted
   })
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Task Generation -- evaluates completed work and plans next batch
+//
+// Called at sprint boundaries and sim day transitions. Reads actual outputs
+// from completed tasks, identifies what's done vs what's needed, and generates
+// context-aware follow-up tasks.
+//
+// This replaces the hardcoded "generate everything at phase start" approach.
+// ---------------------------------------------------------------------------
+
+interface TaskPlan {
+  agentId: string
+  type: string
+  description: string
+  phase: number
+}
+
+export function generateDynamicTasks(phase: number): TaskPlan[] {
+  const db = getDb()
+  const tasks: TaskPlan[] = []
+
+  // 1. Get all completed work this phase with actual outputs
+  const completed = db.query(`
+    SELECT a.agent_id, ag.personality_name, ag.team, ag.role,
+           a.type, a.description, substr(a.output, 1, 1500) as output_preview
+    FROM actions a
+    JOIN agents ag ON ag.id = a.agent_id
+    WHERE a.phase = ? AND a.status = 'completed'
+    ORDER BY a.completed_at DESC
+  `).all(phase) as any[]
+
+  // 2. Get all agents with their current task load
+  const agentLoads = db.query(`
+    SELECT agent_id, COUNT(*) as pending
+    FROM actions
+    WHERE phase = ? AND status IN ('queued', 'running')
+    GROUP BY agent_id
+  `).all(phase) as { agent_id: string; pending: number }[]
+  const loadMap = new Map(agentLoads.map(a => [a.agent_id, a.pending]))
+
+  // 3. Get decisions made (product choice, pricing, etc.)
+  const decisions = db.query(`
+    SELECT made_by_agent, title, body FROM decisions
+    WHERE phase <= ? AND status IN ('approved', 'ratified')
+    ORDER BY created_at DESC LIMIT 5
+  `).all(phase) as any[]
+
+  // 4. Build a summary of what's done
+  const completedByAgent = new Map<string, string[]>()
+  for (const c of completed) {
+    const list = completedByAgent.get(c.agent_id) || []
+    list.push(`${c.type}: ${c.description.slice(0, 100)}`)
+    completedByAgent.set(c.agent_id, list)
+  }
+
+  // 5. Get idle agents (no queued/running tasks)
+  const allAgents = db.query(`
+    SELECT id, personality_name, team, role FROM agents WHERE status != 'suspended'
+  `).all() as { id: string; personality_name: string; team: string; role: string }[]
+
+  const idleAgents = allAgents.filter(a => (loadMap.get(a.id) ?? 0) === 0)
+
+  // 6. Build product context from decisions + completed outputs
+  const productContext = buildProductContext(decisions, completed)
+
+  // 7. Generate tasks based on what's actually needed
+  for (const agent of idleAgents) {
+    const agentCompleted = completedByAgent.get(agent.id) || []
+
+    // Skip if agent has done 3+ tasks this phase (diminishing returns)
+    if (agentCompleted.length >= 3) continue
+
+    const task = planTaskForAgent(agent, phase, productContext, agentCompleted, completed)
+    if (task) tasks.push(task)
+  }
+
+  // Dedup filter (same as generatePhaseTasks)
+  const existing = db.query(`
+    SELECT agent_id, type, substr(description, 1, 80) as desc_prefix FROM actions
+    WHERE phase = ?
+  `).all(phase) as { agent_id: string; type: string; desc_prefix: string }[]
+
+  return tasks.filter(t => {
+    const prefix = t.description.slice(0, 80)
+    return !existing.some(e => e.agent_id === t.agentId && e.desc_prefix === prefix)
+  })
+}
+
+function buildProductContext(decisions: any[], completed: any[]): string {
+  const parts: string[] = []
+
+  // Extract product decisions
+  for (const d of decisions) {
+    parts.push(`DECISION by ${d.made_by_agent}: ${d.title}\n${(d.body ?? '').slice(0, 300)}`)
+  }
+
+  // Extract key deliverables from completed work
+  const keyOutputs = completed
+    .filter((c: any) => ['build', 'write', 'decide'].includes(c.type))
+    .slice(0, 5)
+  for (const c of keyOutputs) {
+    // Look for Handoff section first (structured summary)
+    const handoffIdx = c.output_preview?.indexOf('## Handoff') ?? -1
+    const summary = handoffIdx !== -1
+      ? c.output_preview.slice(handoffIdx, handoffIdx + 500)
+      : c.output_preview?.slice(0, 300) ?? ''
+    parts.push(`${c.personality_name} (${c.type}): ${summary}`)
+  }
+
+  return parts.join('\n\n---\n\n')
+}
+
+function planTaskForAgent(
+  agent: { id: string; personality_name: string; team: string; role: string },
+  phase: number,
+  productContext: string,
+  agentCompleted: string[],
+  allCompleted: any[]
+): TaskPlan | null {
+  // Role-based task planning -- what does this agent's role need to do NEXT
+  // given what's been completed?
+
+  const hasBuilt = allCompleted.some((c: any) => c.type === 'build' && c.team === 'tech')
+  const hasLaunched = allCompleted.some((c: any) =>
+    c.output_preview?.toLowerCase().includes('deploy') ||
+    c.output_preview?.toLowerCase().includes('live') ||
+    c.output_preview?.toLowerCase().includes('launched'))
+  const hasGTM = allCompleted.some((c: any) => c.agent_id === 'sol' && c.type === 'write')
+  const hasCopy = allCompleted.some((c: any) => c.agent_id === 'cass' && c.type === 'write')
+  const hasQA = allCompleted.some((c: any) => c.agent_id === 'theo')
+  const contextSnippet = productContext.slice(0, 800)
+
+  // Phase 2: Build & Validate
+  if (phase === 2) {
+    switch (agent.role) {
+      case 'Engineer':
+        if (!hasBuilt) return { agentId: agent.id, type: 'build', phase,
+          description: `Build the MVP based on team decisions and specs.\n\nContext:\n${contextSnippet}\n\nShip working code a real user can try. Focus on core feature.` }
+        break
+      case 'QA Engineer':
+        if (hasBuilt) return { agentId: agent.id, type: 'review', phase,
+          description: `QA the MVP build. Test core user flows, edge cases, and verify all links/forms work.\n\nContext:\n${contextSnippet}` }
+        break
+    }
+  }
+
+  // Phase 3: Launch & Revenue
+  if (phase === 3) {
+    switch (agent.team) {
+      case 'tech':
+        if (agent.role === 'Engineer' && !hasLaunched)
+          return { agentId: agent.id, type: 'build', phase,
+            description: `Deploy and verify the product is live. Check payment flow, analytics, error monitoring.\n\nWhat was built:\n${contextSnippet}` }
+        if (agent.role === 'QA Engineer' && hasBuilt && !hasQA)
+          return { agentId: agent.id, type: 'review', phase,
+            description: `Run full QA on the live product. Test purchase flow end-to-end, verify all links, check mobile.\n\nProduct context:\n${contextSnippet}` }
+        if (agent.role === 'Frontend Engineer' && hasBuilt)
+          return { agentId: agent.id, type: 'build', phase,
+            description: `Polish the landing page and buyer experience. Check responsive design, load speed, CTA clarity.\n\nProduct context:\n${contextSnippet}` }
+        break
+
+      case 'marketing':
+        if (agent.id === 'sol' && !hasGTM)
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Write launch content for all channels: Product Hunt, Reddit, Twitter/X, email. Customize each for the platform.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'vera')
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Execute growth tactics for launch week. Set up tracking links, schedule posts, identify quick-win distribution channels.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'cass' && !hasCopy)
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Write product copy: Gumroad listing description, email sequences, social proof snippets.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'paz')
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Create visual assets for launch: social media graphics specs, product screenshots layout, brand guidelines for listing.\n\nProduct:\n${contextSnippet}` }
+        break
+
+      case 'strategy':
+        if (agent.id === 'nina')
+          return { agentId: agent.id, type: 'research', phase,
+            description: `Monitor launch metrics and customer feedback. Track: sign-ups, conversions, bounce rate, support requests.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'marcus')
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Post-launch analysis. Revenue vs projections, acquisition cost, channel performance, recommendations.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'zara')
+          return { agentId: agent.id, type: 'research', phase,
+            description: `Competitive response analysis. Monitor competitor reactions, identify positioning opportunities, track market share signals.\n\nProduct:\n${contextSnippet}` }
+        break
+
+      case 'ops':
+        if (agent.id === 'jordan')
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Set up customer support: FAQ, email templates, bug triage workflow, feedback collection.\n\nProduct:\n${contextSnippet}` }
+        if (agent.id === 'alex')
+          return { agentId: agent.id, type: 'write', phase,
+            description: `Financial setup: verify payment processing, set up revenue tracking, reconcile costs vs budget.\n\nProduct:\n${contextSnippet}` }
+        break
+
+      case 'exec':
+        if (agent.id === 'reza' && allCompleted.length >= 5)
+          return { agentId: agent.id, type: 'decide', phase,
+            description: `Review launch progress and make go/iterate decisions. Evaluate team output, identify blockers, prioritize next actions.\n\nCompleted work:\n${contextSnippet}` }
+        if (agent.id === 'priya')
+          return { agentId: agent.id, type: 'review', phase,
+            description: `Audit phase progress: Are all workstreams on track? Who's blocked? What's missing? Flag risks.\n\nCompleted work:\n${contextSnippet}` }
+        break
+    }
+  }
+
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -514,17 +740,78 @@ export function buildSmartContext(
 }
 
 // ---------------------------------------------------------------------------
+// Build smart context AND return which agent IDs were actually cited (top-3)
+// Used by runner.ts to award output_cited only to agents whose work was used
+// ---------------------------------------------------------------------------
+export function buildSmartContextWithCitations(
+  agentId: string,
+  personalityName: string,
+  taskDescription: string,
+  phase: number
+): { context: string; citedAgentIds: string[] } {
+  const relevantWork = scoreContextRelevance(taskDescription, agentId, phase)
+  const top3 = relevantWork.slice(0, 3)
+  const citedAgentIds = [...new Set(top3.map(item => item.agentId).filter(Boolean))]
+
+  // Build the full context using the existing function
+  const context = buildSmartContext(agentId, personalityName, taskDescription, phase)
+
+  return { context, citedAgentIds }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function extractKeywords(text: string): Set<string> {
-  const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can', 'that', 'this', 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'we', 'our', 'you', 'your', 'he', 'she', 'his', 'her', 'not', 'no', 'all', 'each', 'every', 'any', 'some', 'most', 'more', 'less', 'than', 'as', 'so', 'if', 'then', 'else', 'when', 'where', 'how', 'what', 'which', 'who', 'whom'])
-  return new Set(
+// Hoisted to module scope (was re-created on every call)
+const STOP_WORDS = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can', 'that', 'this', 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'we', 'our', 'you', 'your', 'he', 'she', 'his', 'her', 'not', 'no', 'all', 'each', 'every', 'any', 'some', 'most', 'more', 'less', 'than', 'as', 'so', 'if', 'then', 'else', 'when', 'where', 'how', 'what', 'which', 'who', 'whom'])
+
+// Concept synonym groups -- expands keyword matching to catch semantic neighbors
+// "pricing" matches work about "revenue model" even without exact word overlap
+const CONCEPT_GROUPS: string[][] = [
+  ['customer', 'user', 'buyer', 'client', 'audience', 'persona'],
+  ['pricing', 'revenue', 'monetization', 'willingness', 'payment', 'subscription'],
+  ['mvp', 'prototype', 'build', 'ship', 'launch', 'deploy'],
+  ['marketing', 'distribution', 'channel', 'acquisition', 'growth', 'funnel'],
+  ['competitor', 'competition', 'alternative', 'incumbent', 'rival'],
+  ['feedback', 'survey', 'interview', 'validation', 'testing'],
+  ['opportunity', 'niche', 'market', 'segment', 'vertical'],
+  ['brand', 'identity', 'positioning', 'messaging', 'voice'],
+  ['budget', 'spend', 'cost', 'expense', 'investment', 'allocation'],
+  ['blocker', 'obstacle', 'issue', 'problem', 'bottleneck', 'risk'],
+]
+
+// Pre-compute word -> concept group index for O(1) lookup
+const _conceptIndex = new Map<string, number>()
+for (let i = 0; i < CONCEPT_GROUPS.length; i++) {
+  for (const word of CONCEPT_GROUPS[i]) {
+    _conceptIndex.set(word, i)
+  }
+}
+
+function extractKeywords(text: string, expandConcepts = false): Set<string> {
+  const words = new Set(
     text.toLowerCase()
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
-      .filter(w => w.length > 2 && !stopWords.has(w))
+      .filter(w => w.length > 2 && !STOP_WORDS.has(w))
   )
+
+  // Expand with synonym concepts for better semantic matching
+  if (expandConcepts) {
+    const expanded = new Set(words)
+    for (const word of words) {
+      const groupIdx = _conceptIndex.get(word)
+      if (groupIdx !== undefined) {
+        for (const synonym of CONCEPT_GROUPS[groupIdx]) {
+          expanded.add(synonym)
+        }
+      }
+    }
+    return expanded
+  }
+
+  return words
 }
 
 function extractTopics(descriptions: string[]): string[] {
@@ -574,7 +861,13 @@ function extractTopOpportunities(text: string): string {
     }
   }
 
-  return relevant.join('\n\n').slice(0, 2000) || 'See Phase 1 research outputs for opportunity details.'
+  if (relevant.length > 0) {
+    return relevant.join('\n\n').slice(0, 2000)
+  }
+
+  // Fallback: return a chunked summary of the raw output instead of a vague pointer
+  // This ensures downstream agents always get real content to work with
+  return text.slice(0, 2000) || '[NO PRIOR RESEARCH FOUND -- use your best judgment based on the product context]'
 }
 
 function extractCustomerInsights(text: string): string {
@@ -591,5 +884,10 @@ function extractCustomerInsights(text: string): string {
     }
   }
 
-  return relevant.join('\n\n').slice(0, 1500) || 'See Phase 1 customer research for insights.'
+  if (relevant.length > 0) {
+    return relevant.join('\n\n').slice(0, 1500)
+  }
+
+  // Fallback: return raw output chunk instead of a vague pointer
+  return text.slice(0, 1500) || '[NO CUSTOMER RESEARCH FOUND -- use your best judgment based on the product context]'
 }

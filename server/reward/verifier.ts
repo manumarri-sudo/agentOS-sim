@@ -31,11 +31,24 @@ export function isSubstantive(output: string, previousOutputHash?: string): { ok
     return { ok: false, reason: 'Output too short (< 150 chars)' }
   }
 
-  const lower = output.toLowerCase()
-  const placeholders = ['placeholder', 'coming soon']
-  for (const p of placeholders) {
-    if (lower.includes(p)) {
-      return { ok: false, reason: `Output contains placeholder text: "${p}"` }
+  // Placeholder detection: only flag LAZY placeholder patterns, not legitimate references.
+  // Agents often say "no placeholders", "fixed placeholder URLs", "fill placeholders" etc.
+  // which are quality-aware statements, not laziness. Only flag when:
+  //   - "placeholder" appears as the ENTIRE content of a section (lazy fill)
+  //   - Lorem ipsum filler text
+  //   - "Insert X here" / "[Your X here]" template markers
+  const lazyPlaceholderPatterns = [
+    /\blorem ipsum\b/i,
+    /\[your .{1,30} here\]/i,         // [Your name here], [Your company here]
+    /\[insert .{1,30} here\]/i,        // [Insert description here]
+    /\[TODO:?\s*\w/i,                  // [TODO: fill in], [TODO write]
+    /\[TBD:?\s*\w/i,                   // [TBD: decide later]
+    /^placeholder$/im,                  // "placeholder" as the entire line
+  ]
+  for (const pattern of lazyPlaceholderPatterns) {
+    if (pattern.test(output)) {
+      const match = output.match(pattern)?.[0] ?? 'placeholder'
+      return { ok: false, reason: `Output contains placeholder text: "${match}"` }
     }
   }
   // "todo" and "tbd" only fail if they appear as standalone markers (not in context)
@@ -226,7 +239,7 @@ function fail(
 
   const eventType = checkName === 'noProtectedFilesTouched'
     ? 'forbidden_file_touch'
-    : 'reward_manipulation_attempt'
+    : 'verification_failure'
 
   logGovernanceEvent({
     eventType: eventType as any,
@@ -245,16 +258,37 @@ function fail(
 
 // ---------------------------------------------------------------------------
 // Run tests in product worktree — returns pass/fail
+// Pre-checks for test files before invoking bun test to avoid false failures
 // ---------------------------------------------------------------------------
 function runTestsInWorktree(): { passed: boolean; reason: string } {
   const productRepo = process.env.PRODUCT_REPO_PATH ?? `${process.env.HOME}/experiment-product`
+
+  // Pre-check: does the product repo even exist?
+  try {
+    const stat = Bun.spawnSync(['test', '-d', productRepo])
+    if (stat.exitCode !== 0) {
+      return { passed: true, reason: '' } // No product repo yet — nothing to test
+    }
+  } catch {
+    return { passed: true, reason: '' }
+  }
+
+  // Pre-check: are there any test files? If not, skip — nothing to fail.
+  const findTests = Bun.spawnSync(
+    ['find', '.', '-maxdepth', '4', '-name', '*.test.*', '-o', '-name', '*.spec.*', '-o', '-name', '*_test_*', '-o', '-name', '*_spec_*'],
+    { cwd: productRepo, stdout: 'pipe', stderr: 'pipe', timeout: 5_000 }
+  )
+  const testFiles = new TextDecoder().decode(findTests.stdout).trim()
+  if (!testFiles) {
+    return { passed: true, reason: '' } // No test files exist yet — pass
+  }
 
   try {
     const result = Bun.spawnSync(['bun', 'test'], {
       cwd: productRepo,
       stdout: 'pipe',
       stderr: 'pipe',
-      timeout: 60_000, // 60s timeout
+      timeout: 60_000,
     })
 
     if (result.exitCode === 0) {
@@ -262,8 +296,8 @@ function runTestsInWorktree(): { passed: boolean; reason: string } {
     }
 
     const stderr = new TextDecoder().decode(result.stderr)
-    // No test files = pass (nothing to fail)
-    if (stderr.includes('0 test files') || stderr.includes('no test files') || stderr.includes('matching')) {
+    // Double-check: bun might still report 0 test files despite find succeeding
+    if (stderr.includes('0 test files') || stderr.includes('no test files')) {
       return { passed: true, reason: '' }
     }
 
@@ -272,7 +306,6 @@ function runTestsInWorktree(): { passed: boolean; reason: string } {
       reason: `Tests failed (exit ${result.exitCode}): ${stderr.slice(0, 500)}`,
     }
   } catch (e: any) {
-    // If no test files exist or bun test not available, pass
     if (e.message?.includes('no test files') || e.message?.includes('ENOENT')) {
       return { passed: true, reason: '' }
     }

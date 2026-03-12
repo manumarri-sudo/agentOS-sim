@@ -84,6 +84,14 @@ export function BudgetTracker({ budget }: BudgetTrackerProps) {
         </div>
       )}
 
+      {/* API Cost (sunk cost -- informational only) */}
+      {budget.apiCost != null && budget.apiCost > 0 && (
+        <div className="flex justify-between text-[10px] mb-3 opacity-60">
+          <span className="text-muted">API Cost (sunk)</span>
+          <span className="text-muted">{fmtDollars(budget.apiCost)}</span>
+        </div>
+      )}
+
       {/* Phase breakdown */}
       {budget.phaseBreakdown && budget.phaseBreakdown.length > 0 && (
         <>
